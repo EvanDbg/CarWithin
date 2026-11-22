@@ -8,6 +8,9 @@ struct ReceiverConfiguration {
     var address: String
     var ssid: String
     var password: String
+    var networkMode: ReceiverNetworkMode = .wifi
+    var listenerAddress: String? { networkMode.listenerAddress }
+    var isLocalOnly: Bool { networkMode.isLocalOnly }
     var port: UInt16 = 7000
     var width = 1280
     var height = 720
@@ -112,6 +115,42 @@ struct ReceiverConfiguration {
         return result
     }
 
+    /// An arbitrary VPN is not a LocalDevVPN substitute. This only checks the
+    /// expected interface; startup additionally verifies the packet-return path.
+    static func hasLocalDevVPNInterface() -> Bool {
+        var first: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&first) == 0 else { return false }
+        defer { freeifaddrs(first) }
+        var current = first
+        while let entry = current {
+            defer { current = entry.pointee.ifa_next }
+            guard String(cString: entry.pointee.ifa_name).hasPrefix("utun"),
+                  entry.pointee.ifa_flags & UInt32(IFF_UP) != 0,
+                  let address = entry.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0,
+               String(cString: host) == ReceiverNetworkMode.localDevVPN.listenerAddress { return true }
+        }
+        return false
+    }
+
+    /// Rechecked at receiver startup before any output or listener is created.
+    /// The UI must clear external destinations when selecting a local mode.
+    func validateNetworkMode() throws {
+        try networkMode.validateSessionAddress(address)
+        guard isLocalOnly else { return }
+        guard videoOutputPort == nil, secureVideoOutputPort == nil, !browserAudio,
+              airPlayStreamID == nil, !carLifeEnabled, carLifeAddress == nil,
+              zeehoAddress == nil, ninebotAddress == nil, tailingAddress == nil,
+              carLinkRelayAddress == nil else {
+            throw ConfigurationError("本机模式仅在此 iPhone 显示；请关闭浏览器共享及所有外部输出。")
+        }
+        if networkMode == .localDevVPN, !Self.hasLocalDevVPNInterface() {
+            throw ConfigurationError("未找到 LocalDevVPN 默认接口 10.7.1.1。请先手动连接 LocalDevVPN，保持默认 Tunnel IP / Device IP；其他 VPN 不能代替。")
+        }
+    }
+
     static func persistentDeviceID() -> String {
         if let existing = UserDefaults.standard.string(forKey: "receiverDeviceID") { return existing }
         var random = [UInt8](repeating: 0, count: 6)
@@ -123,11 +162,12 @@ struct ReceiverConfiguration {
     }
 
     func validate(requiresLocalAddress: Bool = true, requiresWiFiCredentials: Bool = true) throws {
+        try validateNetworkMode()
         var parsed = in_addr()
         guard inet_pton(AF_INET, address, &parsed) == 1 else {
             throw ConfigurationError("请选择有效的 IPv4 地址。")
         }
-        if requiresLocalAddress && !Self.localIPv4Addresses().contains(address) {
+        if !isLocalOnly && requiresLocalAddress && !Self.localIPv4Addresses().contains(address) {
             throw ConfigurationError("请选择属于本机当前网络连接的 IP 地址。")
         }
         // Fixed presets or a size that follows the head unit: even, within 320…3840 per side and
@@ -173,7 +213,7 @@ struct ReceiverConfiguration {
                 throw ConfigurationError("请输入 CarLink 中继的 IPv4 地址。")
             }
         }
-        guard requiresWiFiCredentials else { return }
+        guard requiresWiFiCredentials && networkMode.requiresWiFiCredentials else { return }
         guard !ssid.isEmpty, ssid.utf8.count <= 32 else {
             throw ConfigurationError(ssid.isEmpty ? "启动前请输入 Wi-Fi 名称。" : "Wi-Fi 名称不能超过 32 个 UTF-8 字节。")
         }

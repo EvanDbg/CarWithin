@@ -8,6 +8,7 @@ final class CarPlayMediaSession {
     private let queue: DispatchQueue
     private let secret: SymmetricKey
     private let peerAddress: String
+    private let localAddress: String?
     private var eventListener: MediaTCPListener?
     private var videoListener: MediaTCPListener?
     private var event: MediaTCPConnection?
@@ -24,8 +25,10 @@ final class CarPlayMediaSession {
     var onLog: ((String) -> Void)?
     var onBrowserAudio: ((Int, AVAudioPCMBuffer, UInt64) -> Void)?
     var onVideo: ((Data, VideoCodec) -> Void)?
-    init(queue: DispatchQueue, secret: SymmetricKey, peerAddress: String, audioEnabled: Bool, hevc: Bool) {
+    init(queue: DispatchQueue, secret: SymmetricKey, peerAddress: String, audioEnabled: Bool, hevc: Bool,
+         localAddress: String? = nil) {
         self.queue = queue; self.secret = secret; self.peerAddress = peerAddress
+        self.localAddress = localAddress
         self.audioEnabled = audioEnabled; self.hevc = hevc
     }
     func setup(_ data: Data) throws -> Data {
@@ -49,7 +52,8 @@ final class CarPlayMediaSession {
                     let microphonePort = requestsMicrophone ? (stream["dataPort"] as? NSNumber).flatMap { UInt16(exactly: $0.intValue) }.flatMap { $0 > 0 ? $0 : nil } : nil
                     audio.removeValue(forKey: type.intValue)?.stop()
                     let output = try CarPlayAudio(secret: secret, peerAddress: peerAddress,
-                        connectionID: connectionID.uint64Value, format: format, microphonePort: microphonePort)
+                        connectionID: connectionID.uint64Value, format: format, microphonePort: microphonePort,
+                        localAddress: localAddress)
                     output.onLog = { [weak self] in self?.onLog?($0) }
                     // Keep calls and Siri on the iPhone; only intended playback goes to LAN viewers.
                     if let onBrowserAudio, !requestsMicrophone, !["telephony", "speechrecognition"].contains(audioType) {
@@ -69,7 +73,7 @@ final class CarPlayMediaSession {
                 video?.stop(); video = nil; videoListener?.stop()
                 screen = ScreenStream(secret: secret, connectionID: connectionID.uint64Value)
                 videoPackets = 0
-                let listener = try MediaTCPListener(queue: queue, peerAddress: peerAddress); videoListener = listener
+                let listener = try MediaTCPListener(queue: queue, peerAddress: peerAddress, localAddress: localAddress); videoListener = listener
                 listener.onConnection = { [weak self] connection in
                     guard let self, self.video == nil else { connection.stop(); return }
                     self.video = connection; self.onLog?("视频 TCP 通道已连接")
@@ -96,8 +100,8 @@ final class CarPlayMediaSession {
             guard eventListener == nil else { throw ProtocolError.malformed("重复的初始 SETUP") }
             let timingPort = (values["timingPort"] as? NSNumber)?.intValue ?? 0
             guard (0...65535).contains(timingPort) else { throw ProtocolError.malformed("时钟同步端口") }
-            timing = try MediaTiming(queue: queue, peerAddress: peerAddress, peerPort: UInt16(timingPort))
-            let listener = try MediaTCPListener(queue: queue, peerAddress: peerAddress); eventListener = listener
+            timing = try MediaTiming(queue: queue, peerAddress: peerAddress, peerPort: UInt16(timingPort), localAddress: localAddress)
+            let listener = try MediaTCPListener(queue: queue, peerAddress: peerAddress, localAddress: localAddress); eventListener = listener
             listener.onConnection = { [weak self] connection in self?.acceptEvent(connection) }
             if let proposed = values["features"] as? [String] {
                 onLog?("iPhone 提议的会话功能：\(proposed.joined(separator: ", "))")

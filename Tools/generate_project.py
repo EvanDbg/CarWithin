@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Generate a dependency-free Xcode project for the native iPad/Catalyst app."""
-import pathlib, hashlib, json, os, plistlib, subprocess
+import pathlib, hashlib, json, os, plistlib, subprocess, argparse
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--fresh', action='store_true',
+                    help='Regenerate using explicit environment/default signing settings; do not read local Xcode settings.')
+arguments = parser.parse_args()
 root = pathlib.Path(__file__).resolve().parents[1]
 project = root / 'TDSCarKit.xcodeproj'; project.mkdir(exist_ok=True)
 # Keep local signing choices when regenerating an existing project. Explicit environment
 # overrides also allow fresh checkouts to be configured without editing generated files.
 local_settings = {}
 existing = project / 'project.pbxproj'
-if existing.exists():
+if existing.exists() and not arguments.fresh:
     converted = subprocess.run(['plutil', '-convert', 'xml1', '-o', '-', str(existing)],
                                check=True, capture_output=True)
     previous = plistlib.loads(converted.stdout)['objects']
@@ -45,7 +49,7 @@ add('sources', f'isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files
 add('resources', f'isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = ({",".join(resource_builds)},); runOnlyForDeploymentPostprocessing = 0;')
 add('frameworks', 'isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0;')
 common = {
-'PRODUCT_NAME':'TDSCarKit', 'PRODUCT_BUNDLE_IDENTIFIER':'local.tds.carkit', 'SWIFT_VERSION':'5.0',
+'PRODUCT_NAME':'TDSCarKit', 'PRODUCT_BUNDLE_IDENTIFIER':'com.evandbg.carwithin.local', 'SWIFT_VERSION':'5.0',
 'IPHONEOS_DEPLOYMENT_TARGET':'16.0', 'MACOSX_DEPLOYMENT_TARGET':'13.3', 'TARGETED_DEVICE_FAMILY':'1,2',
 'SDKROOT':'iphoneos','SUPPORTED_PLATFORMS':'iphoneos iphonesimulator macosx', 'SUPPORTS_MACCATALYST':'YES',
 'SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD':'YES', 'DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER':'NO',
@@ -74,9 +78,10 @@ add('project',f'isa = PBXProject; attributes = {{ LastUpgradeCheck = 1600; }}; b
 schemes=project/'xcshareddata/xcschemes';schemes.mkdir(parents=True,exist_ok=True)
 reference=f'<BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="{uid("target")}" BuildableName="TDSCarKit.app" BlueprintName="TDSCarKit" ReferencedContainer="container:TDSCarKit.xcodeproj"/>'
 (schemes/'TDSCarKit.xcscheme').write_text(f'''<?xml version="1.0" encoding="UTF-8"?>
-<Scheme LastUpgradeVersion="1600" version="1.3">
+<Scheme LastUpgradeVersion="1600" version="1.7">
 <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES"><BuildActionEntries><BuildActionEntry buildForTesting="YES" buildForRunning="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">{reference}</BuildActionEntry></BuildActionEntries></BuildAction>
-<LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.IDEFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" allowLocationSimulation="YES"><BuildableProductRunnable runnableDebuggingMode="0">{reference}</BuildableProductRunnable></LaunchAction>
+<TestAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv="YES" shouldAutocreateTestPlan="YES"/>
+<LaunchAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle="0" useCustomWorkingDirectory="NO" ignoresPersistentStateOnLaunch="NO" debugDocumentVersioning="YES" debugServiceExtension="internal" allowLocationSimulation="YES"><BuildableProductRunnable runnableDebuggingMode="0">{reference}</BuildableProductRunnable></LaunchAction>
 <ProfileAction buildConfiguration="Release" shouldUseLaunchSchemeArgsEnv="YES" savedToolIdentifier="" useCustomWorkingDirectory="NO" debugDocumentVersioning="YES"><BuildableProductRunnable runnableDebuggingMode="0">{reference}</BuildableProductRunnable></ProfileAction>
 <AnalyzeAction buildConfiguration="Debug"/><ArchiveAction buildConfiguration="Release" revealArchiveInOrganizer="YES"/>
 </Scheme>''')

@@ -22,6 +22,6 @@ xcrun swiftc -O -parse-as-library -swift-version 5 \
   -import-objc-header "$project_root/Sources/CTDSCarKitCrypto/include/TDSCarKitCrypto.h" \
   "$project_root"/Sources/TDSCarKitCore/*.swift \
   "$project_root"/Sources/TDSCarKitCore/Vendor/BigInt/*.swift \
-  "$project_root/App/CarPlayAudio.swift" "$project_root/Tools/AudioDecodeSmoke.swift" \
+  "$project_root/App/MediaSockets.swift" "$project_root/App/CarPlayAudio.swift" "$project_root/Tools/AudioDecodeSmoke.swift" \
   "$work_dir/crypto.o" -o "$work_dir/audio-test"
 "$work_dir/audio-test" "$work_dir"

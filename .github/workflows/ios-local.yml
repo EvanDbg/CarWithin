@@ -1,0 +1,74 @@
+name: CarWithin Local — unsigned iOS
+
+on:
+  push:
+    branches:
+      - feature/local-only-cellular
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-local-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build iOS Release
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      # Available on the official macos-15 image; use the same toolchain for tests and the app.
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      TDS_LOCAL_BUNDLE_IDENTIFIER: com.evandbg.carwithin.local
+    steps:
+      - name: Check out source
+        # actions/checkout v7.0.1, verified against its official tag on 2026-11-22.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Show compiler versions
+        run: |
+          xcodebuild -version
+          swift --version
+          python3 --version
+
+      - name: Run core tests
+        run: swift test --configuration release --scratch-path "$RUNNER_TEMP/carwithin-core-tests"
+
+      - name: Verify local socket transport
+        run: bash Tools/test_local_network.sh
+
+      - name: Build and verify an unsigned IPA without accessory credentials
+        run: bash Tools/build_local_ipa.sh "$RUNNER_TEMP/carwithin-local-output"
+
+      - name: Upload unsigned IPA
+        id: ipa
+        # actions/upload-artifact v7.0.2, verified against its official tag on 2026-11-22.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: CarWithin-Local-unsigned-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/carwithin-local-output/CarWithin-Local-unsigned.ipa
+            ${{ runner.temp }}/carwithin-local-output/SHA256SUMS
+            ${{ runner.temp }}/carwithin-local-output/build-info.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          include-hidden-files: false
+
+      - name: Summarize what was verified
+        env:
+          IPA_ARTIFACT_URL: ${{ steps.ipa.outputs.artifact-url }}
+        run: |
+          {
+            echo '## CarWithin Local'
+            echo
+            echo '核心测试、本机 socket 测试和 iOS Release 无签名构建已完成。'
+            echo 'IPA 不包含配件认证身份或 Apple 签名材料。安装前需要自行签名，运行前需要导入有效配件身份。'
+            echo 'CI 不能验证 iPhone 私有 CarPlay 接口、纯蜂窝连接、蓝牙音频或锁屏行为；这些项目仍需真机验收。'
+            echo
+            printf '[下载本次构建产物](%s)\n' "$IPA_ARTIFACT_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

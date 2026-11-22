@@ -1,3 +1,22 @@
+# CarWithin Local（实验分支）
+
+基于 [xmz28/CarWithin](https://github.com/xmz28/CarWithin) 的 **1.0.3 / build 15**，开发基线 `4cdc0f3d0d319bb5fc957932cf1cacf272c02b50`。此分支的目标是在同一台 iPhone 上显示和操作 CarPlay，互联网使用手机蜂窝网络，关闭对外网页共享。
+
+- 默认「仅本机（无需 VPN）」：内部端点绑定 `127.0.0.1`，会话请求不携带 Wi-Fi 凭据。
+- 「LocalDevVPN（实验）」：手动备用，使用明确的本机隧道回送配置，不自动安装或启动 VPN。
+- 可切回原 Wi-Fi 模式使用上游外部输出功能。
+- 独立应用名 `CarWithin Local`、Bundle ID `com.evandbg.carwithin.local`；更新入口指向本 fork。
+
+**状态：实验性实现，尚未完成真实 iPhone 的 CarPlay 会话验证。** 网络回送可达与编译成功都不等于 iOS 会接受这种配件会话。公开构建不包含配件身份、证书私钥或 Apple 签名材料；安装后需提供有效配件身份才能进行连接验证。
+
+详细说明、构建流程和真机验收矩阵见 [docs/LOCAL-ONLY.md](docs/LOCAL-ONLY.md) 与 [SOURCE-BUILD.md](SOURCE-BUILD.md)。原项目及第三方版权和许可证保持不变。
+
+---
+
+## 上游项目说明
+
+以下保留上游说明；其中“必须加入 Wi-Fi”等要求适用于原 Wi-Fi 模式。本实验分支新增的两种仅本机模式以上面的说明为准。
+
 # CarWithin
 
 [English](README.en.md) · **简体中文**

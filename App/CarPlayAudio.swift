@@ -5,11 +5,12 @@ import CryptoKit
 import Darwin
 import Network
 
-private final class AudioDatagramPort {
+final class AudioDatagramPort {
     let port: UInt16
+    let boundAddress: String
     private var source: DispatchSourceRead?
     var onPacket: ((Data) -> Void)?
-    init(queue: DispatchQueue, peerAddress: String) throws {
+    init(queue: DispatchQueue, peerAddress: String, localAddress: String? = nil) throws {
         let fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { throw POSIXError(.EIO) }
         var receiveBuffer: Int32 = 512 * 1024
@@ -17,12 +18,15 @@ private final class AudioDatagramPort {
         var allowed = in_addr()
         guard inet_pton(AF_INET, peerAddress, &allowed) == 1 else { close(fd); throw ProtocolError.malformed("音频对端地址") }
         var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); address.sin_family = sa_family_t(AF_INET)
+        do { try ReceiverSocketBinding.apply(localAddress, to: &address) }
+        catch { close(fd); throw error }
         let bound = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         guard bound == 0, fcntl(fd, F_SETFL, O_NONBLOCK) == 0 else { close(fd); throw POSIXError(.EIO) }
         var count = socklen_t(MemoryLayout<sockaddr_in>.size)
         let named = withUnsafeMutablePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &count) } }
         guard named == 0 else { close(fd); throw POSIXError(.EIO) }
         port = UInt16(bigEndian: address.sin_port)
+        boundAddress = ReceiverSocketBinding.numericAddress(address.sin_addr)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue); self.source = source
         source.setEventHandler { [weak self] in
             guard let self else { return }
@@ -82,16 +86,18 @@ final class CarPlayAudio {
     #endif
     var onLog: ((String) -> Void)?
     var onBrowserAudio: ((AVAudioPCMBuffer, UInt64) -> Void)?
-    init(secret: SymmetricKey, peerAddress: String, connectionID: UInt64, format: ReceiverAudioFormat, microphonePort: UInt16? = nil) throws {
+    init(secret: SymmetricKey, peerAddress: String, connectionID: UInt64, format: ReceiverAudioFormat,
+         microphonePort: UInt16? = nil, localAddress: String? = nil) throws {
         self.queue = Self.renderQueue; self.connectionID = connectionID; self.format = format
         decoder = try NativeAudioDecoder(format: format)
         output = decoder.output
         cipher = AudioStream(secret: secret, connectionID: connectionID)
-        data = try AudioDatagramPort(queue: Self.renderQueue, peerAddress: peerAddress)
-        control = try AudioDatagramPort(queue: Self.renderQueue, peerAddress: peerAddress)
+        data = try AudioDatagramPort(queue: Self.renderQueue, peerAddress: peerAddress, localAddress: localAddress)
+        control = try AudioDatagramPort(queue: Self.renderQueue, peerAddress: peerAddress, localAddress: localAddress)
         dataPort = data.port; controlPort = control.port
         if let microphonePort, !format.isAAC, format.channels == 1 {
-            microphone = NativeMicrophone(secret: secret, connectionID: connectionID, address: peerAddress, port: microphonePort, format: format)
+            microphone = try NativeMicrophone(secret: secret, connectionID: connectionID, address: peerAddress,
+                port: microphonePort, format: format, localAddress: localAddress)
         }
         data.onPacket = { [weak self] in self?.receive($0) }
     }
@@ -347,10 +353,12 @@ private final class NativeMicrophone {
     private var pending = Data()
     private var failures = 0
     var onLog: ((String) -> Void)?
-    init(secret: SymmetricKey, connectionID: UInt64, address: String, port: UInt16, format: ReceiverAudioFormat) {
+    init(secret: SymmetricKey, connectionID: UInt64, address: String, port: UInt16, format: ReceiverAudioFormat,
+         localAddress: String? = nil) throws {
         self.rate = format.sampleRate; self.format = format
         packetizer = MicrophonePacketizer(secret: secret, connectionID: connectionID)
-        connection = NWConnection(host: NWEndpoint.Host(address), port: NWEndpoint.Port(rawValue: port)!, using: .udp)
+        let parameters = try ReceiverSocketBinding.parameters(localAddress: localAddress, udp: true)
+        connection = NWConnection(host: NWEndpoint.Host(address), port: NWEndpoint.Port(rawValue: port)!, using: parameters)
     }
     func start() {
         guard active else { return }

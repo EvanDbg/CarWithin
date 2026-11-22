@@ -29,7 +29,12 @@ final class SameDeviceProbe {
         let run = generation
         transport.onData = { [weak self] data in self?.receive(data) }
         do {
-            // Use transport type 2 for a Wi-Fi accessory connection.
+            try configuration.validateNetworkMode()
+            // Keep the known accessory transport. A successful TCP self-probe
+            // does not prove iOS accepts CarPlay without a Wi-Fi association.
+            if configuration.isLocalOnly {
+                onLog?("实验性本机会话：\(configuration.networkMode.rawValue)，目标 \(configuration.address)，不发送 Wi-Fi 名称或密码；仍需验证 iOS 的完整 CarPlay 握手")
+            }
             try transport.start(withIdentifier: configuration.deviceID, transportType: 2)
             stage("已创建本机配件端点（传输类型 2），正在建立 iAP2")
             try transport.send(IAP2Packet.presence)
@@ -47,7 +52,11 @@ final class SameDeviceProbe {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
                 guard let self, self.active, self.generation == run, self.expectsLocalControl, !self.controlConnected else { return }
-                self.finish("未收到 CarPlay 控制连接，请检查 Wi-Fi 名称和密码后重试。兼容信道通常可保持默认值。")
+                if self.configuration?.isLocalOnly == true {
+                    self.finish("未收到本机 CarPlay 控制连接。此设备上的实验会话尚未建立；请导出日志。不会自动切换 Wi-Fi 或 VPN。")
+                } else {
+                    self.finish("未收到 CarPlay 控制连接，请检查 Wi-Fi 名称和密码后重试。兼容信道通常可保持默认值。")
+                }
             }
         } catch { finish("本机传输失败：\(error.localizedDescription)") }
     }
@@ -62,9 +71,9 @@ final class SameDeviceProbe {
         stage("CarPlay 控制连接已建立，正在协商会话")
     }
     private func requestSession(_ configuration: ReceiverConfiguration) throws {
-        let wifi = try AccessoryMessages.WiFi(ssid: configuration.ssid, password: configuration.password, channel: configuration.wifiChannel)
-        try send(AccessoryMessages.startSession(address: configuration.address, port: configuration.port,
-            deviceID: configuration.deviceID, wifi: wifi))
+        try send(configuration.networkMode.startSession(address: configuration.address, port: configuration.port,
+            deviceID: configuration.deviceID, ssid: configuration.ssid, password: configuration.password,
+            wifiChannel: configuration.wifiChannel))
     }
     private func stage(_ message: String) { onLog?(message); onStage?(message) }
     private func finish(_ message: String) { onLog?(message); stop(); onFinished?(message) }

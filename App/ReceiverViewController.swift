@@ -18,6 +18,18 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private let receiverPicker = UIButton(type: .system)
     private var remoteTarget: TDSCarKitReceiverBrowser.Target?
     private let modeControl = UISegmentedControl(items: ["接收其他设备", "本机 CarPlay", "投送到 iPad"])
+    private static let networkChoices: [ReceiverNetworkMode] = [.loopback, .localDevVPN, .wifi]
+    private let networkModeControl = ChoiceMenu(items: ["仅本机（无需 VPN）", "LocalDevVPN（实验）", "原 Wi-Fi 模式"])
+    private var selectedNetworkMode: ReceiverNetworkMode {
+        let index = networkModeControl.selectedSegmentIndex
+        return Self.networkChoices.indices.contains(index) ? Self.networkChoices[index] : .loopback
+    }
+    /// Other-device receiving/sending always retains the original Wi-Fi transport.
+    private var effectiveNetworkMode: ReceiverNetworkMode {
+        modeControl.selectedSegmentIndex == 1 ? selectedNetworkMode : .wifi
+    }
+    private var isLocalOnly: Bool { effectiveNetworkMode.isLocalOnly }
+    private var importingAccessoryIdentity = false
     private let nameField = UITextField()
     private let ipField = UITextField()
     private let ssidField = UITextField()
@@ -53,6 +65,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }()
     private var receivesAudioFromAnotherDevice: Bool { modeControl.selectedSegmentIndex == 0 }
     private var soundOutput: SoundOutput {
+        if isLocalOnly { return .phone }
         if outputMode == .carLife || outputMode == .airPlay || outputMode.usesInstrumentWiFi { return .phone }
         if selectedSoundOutput == .carWithin && !receivesAudioFromAnotherDevice { return .phone }
         if selectedSoundOutput == .browser && !videoOutputSwitch.isOn { return .phone }
@@ -79,10 +92,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private let transportProbeButton = UIButton(type: .system)
     private let orientationControl = ChoiceMenu(items: ["横屏", "竖屏"])
     private let wifiPathMonitor = NWPathMonitor(requiredInterfaceType: .wifi)
+    private let internetPathMonitor = NWPathMonitor()
+    private var internetPathSummary = "正在检查系统网络"
     private var networkStartupTask: Task<Void, Never>?
     private var waitingForNetwork = false
     private var networkRestartCount = 0
     private var localStartupID: UUID?
+    private var localStartupDeadline: DispatchWorkItem?
+    private var localStartupStage = "等待本机监听器"
     private let aspectRatioControl = ChoiceMenu(items: ["预设比例"] + ReceiverConfiguration.aspectRatios.map(\.title))
     private let resolutionControl = ChoiceMenu(items: ReceiverConfiguration.resolutions.map { "\($0.label)（\($0.width)×\($0.height)）" })
     private let frameRateControl = ChoiceMenu(items: ["自动", "30 FPS", "60 FPS"])
@@ -155,7 +172,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private let browserViewersLabel = UILabel()
     private let browserCopyButton = UIButton(type: .system)
     private let bluetoothSetupSwitch = UISwitch()
-    private var needsNetworkDetails: Bool { modeControl.selectedSegmentIndex != 0 || bluetoothSetupSwitch.isOn }
+    private var needsNetworkDetails: Bool {
+        !isLocalOnly && (modeControl.selectedSegmentIndex != 0 || bluetoothSetupSwitch.isOn)
+    }
     private let startButton = UIButton(type: .system)
     private let heading = UILabel()
     private let explanation = UILabel()
@@ -195,7 +214,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             airPlayRoutePicker.accessibilityTraits.insert(.notEnabled)
         }
     }
-    private var outputMode: HeadUnitOutput { HeadUnitOutput(rawValue: headUnitOutput.selectedSegmentIndex) ?? .browser }
+    private var outputMode: HeadUnitOutput {
+        isLocalOnly ? .browser : HeadUnitOutput(rawValue: headUnitOutput.selectedSegmentIndex) ?? .browser
+    }
     private let carLifeAddressField = UITextField()
     private let carLifeStatus = StatusLabel()
     private func updateCarLifeStatus(_ message: String) {
@@ -228,7 +249,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private var updateTimer: Timer?
     private weak var updateSheet: UIViewController?
     private var updateSheetAutomatic = false
-    private static let projectURL = URL(string: "https://github.com/xmz28/CarWithin")!
+    private static let projectURL = URL(string: "https://github.com/EvanDbg/CarWithin")!
     private static let releasesURL = projectURL.appendingPathComponent("releases")
     private static let supportURL = URL(string: "https://qr.alipay.com/fkx16608y1puemmltuocze0")!
     private static let authorURL = URL(string: "https://v.douyin.com/x64M2NbYj0A/")!
@@ -276,7 +297,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        title = "CarWithin"
+        title = "CarWithin Local"
         navigationItem.largeTitleDisplayMode = .never
         view.backgroundColor = .systemGroupedBackground
         navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "gearshape.fill"), style: .plain, target: self, action: #selector(toggleSettings))
@@ -527,7 +548,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             stack.widthAnchor.constraint(lessThanOrEqualToConstant: 720)
         ])
         receiver.onLog = { [weak self] in self?.log($0) }; bluetooth.onLog = { [weak self] in self?.log($0) }
-        receiver.onControlConnected = { [weak self] in self?.sameDevice.didConnectControl() }
+        receiver.onControlConnected = { [weak self] in
+            self?.localStartupStage = "控制连接已建立，等待认证和视频"
+            self?.sameDevice.didConnectControl()
+        }
         receiver.onVideo = { [weak self] data, codec in
             guard let self, self.running else { return }
             // Nothing local is visible in the background without PiP: save the decoding work.
@@ -537,22 +561,24 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             }
             do {
                 try self.videoSurface.enqueue(accessUnit: data, codec: codec)
-                if !self.displayedVideo {
-                    self.inlineVideoContainer.isHidden = false
-                    self.displayedVideo = true; self.statusLabel.text = "正在显示 CarPlay"
-                    self.clearStartupHint()
-                    self.networkStartupTask?.cancel()
-                    self.networkStartupTask = nil
-                    self.videoActions.isHidden = false; self.controlBar.isHidden = false
-                    self.log("视频已送入本机显示层")
-                    if UIDevice.current.userInterfaceIdiom == .pad { self.showFullscreen() }
-                    self.updatePictureInPicturePolicy()
-                }
                 self.pictureInPicture.sourceMayBeReady()
             } catch {
                 self.statusLabel.text = "视频显示异常"
                 self.log("视频显示失败：\(error.localizedDescription)")
             }
+        }
+        videoSurface.onFirstFrameEnqueued = { [weak self] in
+            guard let self, self.running, !self.displayedVideo else { return }
+            self.inlineVideoContainer.isHidden = false
+            self.displayedVideo = true; self.statusLabel.text = "正在显示 CarPlay"
+            self.clearStartupHint()
+            self.localStartupDeadline?.cancel(); self.localStartupDeadline = nil
+            self.networkStartupTask?.cancel(); self.networkStartupTask = nil
+            self.videoActions.isHidden = false; self.controlBar.isHidden = false
+            self.log("首个视频帧已送入本机显示层；实际画面仍以屏幕为准")
+            if UIDevice.current.userInterfaceIdiom == .pad { self.showFullscreen() }
+            self.updatePictureInPicturePolicy()
+            self.pictureInPicture.sourceMayBeReady()
         }
         videoSurface.onLog = { [weak self] in self?.log($0) }
         videoSurface.onKeyframeNeeded = { [weak self] reason in
@@ -646,6 +672,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }
         sameDevice.onStage = { [weak self] message in
             guard let self, self.running, !self.displayedVideo else { return }
+            self.localStartupStage = message
             if self.modeControl.selectedSegmentIndex == 2 {
                 self.statusLabel.text = message.contains("已请求")
                     ? "已请求连接，请保持 App 运行" : "正在连接 iPad…"
@@ -670,6 +697,18 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             DispatchQueue.main.async { self?.refreshNetworkAddresses() }
         }
         wifiPathMonitor.start(queue: DispatchQueue(label: "CarWithin.wifiPath"))
+        internetPathMonitor.pathUpdateHandler = { [weak self] path in
+            let summary: String
+            if path.status != .satisfied { summary = "互联网暂不可用" }
+            else if path.usesInterfaceType(.cellular) { summary = "系统当前使用蜂窝网络" }
+            else if path.usesInterfaceType(.wifi) { summary = "系统当前使用 Wi-Fi；纯蜂窝使用时请断开 Wi-Fi" }
+            else { summary = "系统当前使用其他网络路径" }
+            DispatchQueue.main.async {
+                self?.internetPathSummary = summary
+                self?.refreshNetworkSummary()
+            }
+        }
+        internetPathMonitor.start(queue: DispatchQueue(label: "CarWithin.internetPath"))
         loadIdentity()
         loadWiFiPassword()
         modeChanged()
@@ -692,7 +731,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }
     deinit {
         wifiPathMonitor.cancel()
+        internetPathMonitor.cancel()
         networkStartupTask?.cancel()
+        localStartupDeadline?.cancel()
     }
 
     /// Presets are listed on their own settings page; refresh it if it is open.
@@ -746,9 +787,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         defaults.set(carButtonSwitch.isOn, forKey: "carButton")
     }
     private var selectedPerformance: BrowserPerformance { BrowserPerformance.allCases[max(0, performanceControl.selectedSegmentIndex)] }
-    private var followsCarScreen: Bool { sizeModeControl.selectedSegmentIndex == 0 }
+    private var followsCarScreen: Bool { !isLocalOnly && sizeModeControl.selectedSegmentIndex == 0 }
     /// The screen "跟随车机" sizes for: reported in this run, else the ticked or latest saved one.
-    private var targetScreen: CarScreen? { outputMode == .browser ? reportedScreen ?? CarScreenStore.preferred() : nil }
+    private var targetScreen: CarScreen? { !isLocalOnly && outputMode == .browser ? reportedScreen ?? CarScreenStore.preferred() : nil }
 
     /// Size, frame rate and codec for the next session from the settings, the known head-unit
     /// screen and any lighter level chosen by "自动重启".
@@ -892,13 +933,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }
     }
     @objc private func videoOutputToggled() {
-        guard !running else { return }
+        guard !running, !isLocalOnly else { return }
         UserDefaults.standard.set(videoOutputSwitch.isOn, forKey: "videoOutputEnabled")
         refreshVideoOutputSummary()
         reloadVisibleSettings()
     }
     private var browserAddress: String? {
-        ReceiverConfiguration.wifiIPv4Address()
+        guard !isLocalOnly else { return nil }
+        return ReceiverConfiguration.wifiIPv4Address()
             ?? (UIDevice.current.userInterfaceIdiom == .phone ? nil : ReceiverConfiguration.localIPv4Addresses().first)
     }
     private func portNumber(_ text: String?) -> UInt16? {
@@ -925,7 +967,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         return "http://\(address):\(browserPort)"
     }
     private var localBrowserURL: URL? {
-        browserPort.flatMap { URL(string: "http://127.0.0.1:\($0)/") }
+        isLocalOnly ? nil : browserPort.flatMap { URL(string: "http://127.0.0.1:\($0)/") }
     }
     private var secureBrowserURL: String? {
         guard let address = browserAddress, let port = secureBrowserPort, port != browserPort else { return nil }
@@ -977,6 +1019,17 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }
 
     private func refreshVideoOutputSummary() {
+        if isLocalOnly {
+            [browserCard, zeehoCard, ninebotCard, tailingCard, carLifeCard, airPlayCard].forEach { $0.isHidden = true }
+            videoOutputSwitch.isEnabled = false
+            videoOutputPortField.isEnabled = false
+            secureVideoOutputPortField.isEnabled = false
+            browserURLLabel.text = "仅本机模式不提供网页共享"
+            secureBrowserURLLabel.text = nil
+            browserCopyButton.isEnabled = false
+            secureBrowserCopyButton.isEnabled = false
+            return
+        }
         videoOutputSwitch.isEnabled = !running && outputMode == .browser
         videoOutputPortField.isEnabled = !running && outputMode == .browser && videoOutputSwitch.isOn
         secureVideoOutputPortField.isEnabled = videoOutputPortField.isEnabled
@@ -1038,6 +1091,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         if carButtonSwitch.isOn {
             config.oemIconPNG = customVehicleIcon ?? Self.carButtonIcon
             config.oemIconLabel = String((nameField.text ?? "").prefix(12)).isEmpty ? "CarWithin" : String((nameField.text ?? "").prefix(12))
+        }
+        if config.isLocalOnly {
+            config.audioEnabled = false
+            config.browserAudio = false
+            config.videoOutputPort = nil
+            config.secureVideoOutputPort = nil
+            log("仅本机画面：\(plan.width)×\(plan.height) @ \(plan.fps) FPS \(plan.codec.displayName)，声音由 iPhone 或蓝牙输出")
+            return
         }
         let source = outputMode != .browser ? headUnitOutput.selectedTitle
             : followsCarScreen ? (screen.map { "车机屏幕 \($0.title)" } ?? "尚无车机屏幕，用固定分辨率") : "固定尺寸"
@@ -1211,6 +1272,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         } catch { passwordStatus.text = "无法读取已保存的密码，请重新输入。" }
     }
     private func refreshNetworkSummary() {
+        if isLocalOnly {
+            networkSummary.text = "\(networkModeControl.selectedTitle) · \(internetPathSummary)"
+            return
+        }
         let name = ssidField.text ?? ""
         if needsNetworkDetails, !name.isEmpty {
             networkSummary.text = "CarPlay Wi-Fi 预设：\(name)"
@@ -1350,7 +1415,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         } catch {
             identity = nil
             statusLabel.text = "尚未导入有效的 MFi 身份"; startButton.isEnabled = false
-            log("请通过 Documents/IdentityImport 导入 certificate.p7b、leaf.cer 和 private.x963。错误：\(error.localizedDescription)")
+            log("请在设置 → 配件身份导入包含 certificate.p7b、leaf.cer 和 private.x963 的文件夹。错误：\(error.localizedDescription)")
             if importing { saveIdentityImportResult("failure: \(error.localizedDescription)") }
         }
     }
@@ -1370,13 +1435,16 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         updateCheckTask?.cancel()
         view.endEditing(true)
         refreshNetworkAddresses()
-        let channel = UInt8(channelField.text ?? "") ?? 36
+        let channel = needsNetworkDetails ? UInt8(channelField.text ?? "") ?? 36 : 36
         guard (1...196).contains(channel) else {
             revealSettings(); statusLabel.text = "兼容信道请输入 1–196，或留空使用默认值 36。"; return
         }
         let outputPort: UInt16?
         let httpsPort: UInt16?
-        if outputMode == .browser && videoOutputSwitch.isOn {
+        if isLocalOnly {
+            outputPort = nil
+            httpsPort = nil
+        } else if outputMode == .browser && videoOutputSwitch.isOn {
             if let error = browserPortError {
                 statusLabel.text = error
                 revealSettings(output: true)
@@ -1424,9 +1492,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             guard let identity else { return }
             guard let address = localCarPlayAddress else { waitForLocalNetwork(); return }
             var config = ReceiverConfiguration(name: nameField.text ?? "CarWithin", address: address,
-                ssid: ssidField.text ?? "", password: password, wifiChannel: channel, audioEnabled: soundOutput != .phone,
+                ssid: isLocalOnly ? "" : ssidField.text ?? "", password: password, wifiChannel: channel, audioEnabled: soundOutput != .phone,
                 videoOutputPort: outputPort, secureVideoOutputPort: httpsPort,
                 deviceID: ReceiverConfiguration.persistentDeviceID())
+            config.networkMode = effectiveNetworkMode
             if !restartingAutomatically { autoRestarts = 0; lightLevel = 0; reportedScreen = nil; primaryViewer = nil }
             configureDisplay(&config)
             do { try config.validate() } catch {
@@ -1448,15 +1517,18 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             UIApplication.shared.isIdleTimerDisabled = true
             let startupID = UUID()
             localStartupID = startupID
+            localStartupStage = "等待本机监听器"
+            if config.isLocalOnly { scheduleLocalStartupDeadline(startupID) }
             receiver.onListening = { [weak self] port in
                 guard let self, self.running, self.localStartupID == startupID else { return }
+                self.localStartupStage = "监听器已就绪，等待虚拟配件和控制连接"
                 var live = config; live.port = port
-                self.controlBrowser.start()
+                if !config.isLocalOnly { self.controlBrowser.start() }
                 self.sameDevice.start(configuration: live, identity: identity)
             }
-            prepareExternalOutput(configuration: config)
+            if !config.isLocalOnly { prepareExternalOutput(configuration: config) }
             receiver.start(configuration: config, identity: identity, preferredViewer: primaryViewer)
-            watchStartupAddress(address)
+            if !config.isLocalOnly { watchStartupAddress(address) }
             return
         }
         guard let identity else { return }
@@ -1490,7 +1562,8 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         receiver.start(configuration: config, identity: identity)
     }
     private var localCarPlayAddress: String? {
-        outputMode.usesInstrumentWiFi ? ReceiverConfiguration.wifiIPv4Address() : browserAddress
+        effectiveNetworkMode.sessionAddress
+            ?? (outputMode.usesInstrumentWiFi ? ReceiverConfiguration.wifiIPv4Address() : browserAddress)
     }
 
     private func refreshNetworkAddresses() {
@@ -1556,6 +1629,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
 
     private func stop() {
         localStartupID = nil
+        localStartupDeadline?.cancel(); localStartupDeadline = nil
         networkStartupTask?.cancel()
         networkStartupTask = nil
         waitingForNetwork = false
@@ -1585,6 +1659,23 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         log("CarPlay 接收已停止")
     }
 
+    private func scheduleLocalStartupDeadline(_ startupID: UUID) {
+        localStartupDeadline?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            guard let self, self.running, !self.displayedVideo,
+                  self.localStartupID == startupID else { return }
+            let stage = self.localStartupStage
+            let suggestion = self.effectiveNetworkMode == .loopback
+                ? "保存日志后，可手动切换 LocalDevVPN（实验）再测试。"
+                : "保存日志并检查配件身份、LocalDevVPN 回送路径及当前 iOS 的兼容性。"
+            self.log("本机启动超过 75 秒仍未向显示层提交视频帧。最后阶段：\(stage)")
+            self.stop()
+            self.statusLabel.text = "本机会话启动超时。\(suggestion)"
+        }
+        localStartupDeadline = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 75, execute: task)
+    }
+
     private func clearStartupHint() {
         startupHintTask?.cancel()
         startupHintTask = nil
@@ -1599,7 +1690,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         let task = DispatchWorkItem { [weak self] in
             guard let self, self.startupHintGeneration == generation, self.running,
                   !self.displayedVideo, self.modeControl.selectedSegmentIndex == 1 else { return }
-            self.startupHint.text = "连接较久时，可尝试在系统设置中关闭再打开 Wi-Fi。当前仍在继续连接。"
+            switch self.effectiveNetworkMode {
+            case .loopback:
+                self.startupHint.text = "正在验证本机回环会话。若超时，请保存日志；可在停止后手动测试 LocalDevVPN 备用方式。"
+            case .localDevVPN:
+                self.startupHint.text = "正在验证本机隧道会话。请保持 LocalDevVPN 开启；网络可达仍需 iOS 接受 CarPlay 会话。"
+            case .wifi:
+                self.startupHint.text = "连接较久时，可尝试在系统设置中关闭再打开 Wi-Fi。当前仍在继续连接。"
+            }
             self.startupHint.isHidden = false
         }
         startupHintTask = task
@@ -1617,7 +1715,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             receiverPicker.setTitle("正在搜索 iPad 接收端…", for: .normal)
             receiverBrowser.start()
         }
-        let title = remote ? "连接到 iPad" : local ? "本机 CarPlay" : "CarPlay 接收屏"
+        let title = remote ? "连接到 iPad" : isLocalOnly ? "CarWithin Local · 实验版" : local ? "本机 CarPlay" : "CarPlay 接收屏"
         let headingText = NSMutableAttributedString(string: title)
         if local, let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
             headingText.append(NSAttributedString(string: "（\(version)）", attributes: [
@@ -1628,7 +1726,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         heading.attributedText = headingText
         explanation.text = remote ? "选择一台 iPad，把这台 iPhone 的 CarPlay 投送到它的屏幕。"
             : local ? "无需外接盒子，直接在这台 iPhone 上启动并显示 CarPlay。" : "接收另一台 iPhone 的导航、音乐和触控画面。"
-        connectionHelp.text = remote
+        connectionHelp.text = isLocalOnly
+            ? "画面与操作留在本机，不开启网页共享。纯蜂窝使用时请断开 Wi-Fi；此模式仍需真机验证。"
+            : remote
             ? "让 iPhone 和 iPad 连接同一个 Wi-Fi。"
             : local ? "先在系统设置连接 Wi-Fi，再在 CarWithin 选择对应预设。"
             : "先启动此接收屏，再从另一台 iPhone 发起连接。"
@@ -1641,9 +1741,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         refreshCurrentNetwork(requestPermission: false)
     }
     private func setEditing(_ value: Bool) {
+        networkModeControl.isEnabled = value
         [nameField, ipField, ssidField, passwordField, channelField, videoOutputPortField, secureVideoOutputPortField].forEach { $0.isEnabled = value }
         openNetworkSwitch.isEnabled = value
-        videoOutputSwitch.isEnabled = value && outputMode == .browser
+        videoOutputSwitch.isEnabled = value && !isLocalOnly && outputMode == .browser
         orientationControl.isEnabled = value
         resolutionControl.isEnabled = value
         aspectRatioControl.isEnabled = value
@@ -1654,7 +1755,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         driveControl.isEnabled = value
         bluetoothSetupSwitch.isEnabled = value
         transportProbeButton.isEnabled = value
-        headUnitOutput.isEnabled = value
+        headUnitOutput.isEnabled = value && !isLocalOnly
         zeehoAddressField.isEnabled = value
         ninebotAddressField.isEnabled = value
         tailingAddressField.isEnabled = value
@@ -1832,11 +1933,15 @@ extension ReceiverViewController {
     /// settings pages; the rest of this controller reads them directly.
     fileprivate func configureSettingsControls() {
         let defaults = UserDefaults.standard
+        let savedNetwork = defaults.string(forKey: "localReceiverNetworkMode")
+            .flatMap(ReceiverNetworkMode.init(rawValue:)) ?? .loopback
+        networkModeControl.selectedSegmentIndex = Self.networkChoices.firstIndex(of: savedNetwork) ?? 0
+        networkModeControl.addTarget(self, action: #selector(networkModeChanged), for: .valueChanged)
         if !defaults.bool(forKey: "didApplyLeftHandDefaultV2") {
             defaults.set(false, forKey: "rightHandDrive"); defaults.set(true, forKey: "didApplyLeftHandDefaultV2")
         }
         if !defaults.bool(forKey: "didApplyBrowserDefaultV3") {
-            defaults.set(true, forKey: "videoOutputEnabled"); defaults.set(60, forKey: "displayMaxFPS")
+            defaults.set(false, forKey: "videoOutputEnabled"); defaults.set(30, forKey: "displayMaxFPS")
             defaults.set(true, forKey: "didApplyBrowserDefaultV3")
         }
         driveControl.selectedSegmentIndex = defaults.bool(forKey: "rightHandDrive") ? 1 : 0
@@ -1900,7 +2005,7 @@ extension ReceiverViewController {
         carLifeAddressField.addTarget(self, action: #selector(saveHeadUnitOutput), for: .editingDidEnd)
         updateCarLifeStatus("等待启动 CarPlay。")
         updateAirPlayStatus("等待启动 CarPlay。")
-        videoOutputSwitch.isOn = defaults.object(forKey: "videoOutputEnabled") as? Bool ?? true
+        videoOutputSwitch.isOn = defaults.object(forKey: "videoOutputEnabled") as? Bool ?? false
         videoOutputSwitch.addTarget(self, action: #selector(videoOutputToggled), for: .valueChanged)
         videoOutputPortField.text = String(defaults.object(forKey: "videoOutputPort") as? Int ?? 9888)
         secureVideoOutputPortField.text = (defaults.object(forKey: "secureVideoOutputPort") as? Int).map { String($0) }
@@ -1934,12 +2039,21 @@ extension ReceiverViewController {
     }
 
     @objc private func saveHeadUnitOutput() {
-        UserDefaults.standard.set(outputMode.rawValue, forKey: "headUnitOutputV2")
+        let selectedOutput = HeadUnitOutput(rawValue: headUnitOutput.selectedSegmentIndex) ?? .browser
+        UserDefaults.standard.set(selectedOutput.rawValue, forKey: "headUnitOutputV2")
         UserDefaults.standard.set(carLifeAddressField.text ?? "", forKey: "carLifeAddress")
         UserDefaults.standard.set(zeehoAddressField.text ?? "", forKey: "zeehoAddress")
         UserDefaults.standard.set(ninebotAddressField.text ?? "", forKey: "ninebotAddress")
         UserDefaults.standard.set(tailingAddressField.text ?? "", forKey: "tailingAddress")
         refreshVideoOutputSummary()
+    }
+    @objc private func networkModeChanged() {
+        guard !running, !waitingForNetwork else { return }
+        UserDefaults.standard.set(selectedNetworkMode.rawValue, forKey: "localReceiverNetworkMode")
+        modeChanged()
+        setEditing(true)
+        updateVideoAspect()
+        reloadVisibleSettings()
     }
     @objc private func headUnitOutputChanged() {
         saveHeadUnitOutput()
@@ -2012,9 +2126,70 @@ extension ReceiverViewController {
         ]
     }
 
-    private func usagePage() -> SettingsPageController {
-        page("使用说明") {
+    private func networkModePage() -> SettingsPageController {
+        page("连接方式") { [unowned self] in
             [
+                SettingsSection("本机 CarPlay", footer: editingLockedFooter ?? "优先使用无需 VPN 的本机模式。是否能建立完整会话取决于这台 iPhone 的系统与签名，仍需实测。", [
+                    .control("连接方式", icon: ("network", .systemIndigo), networkModeControl),
+                    .info("系统网络", internetPathSummary)
+                ]),
+                SettingsSection("仅本机（无需 VPN）", footer: "使用本机回环连接，不要求 Wi-Fi 预设，也不启动网页共享。导航和音乐联网由 iOS 管理；要只使用蜂窝数据，请断开 Wi-Fi。", []),
+                SettingsSection("LocalDevVPN（实验备用）", footer: "仅在纯回环无法连接时手动测试。先在 LocalDevVPN 中启用默认配置：Tunnel IP 10.7.1.1、Device IP 10.7.0.1。普通代理 VPN 不等同于这种本机回送机制。应用不会自动安装、连接或修改 VPN。", []),
+                SettingsSection("原 Wi-Fi 模式", footer: "恢复原来的局域网与外部输出功能，需要加入 Wi-Fi。各输出设置仅在此模式下生效。", [])
+            ]
+        }
+    }
+
+    private func accessoryIdentityPage() -> SettingsPageController {
+        page("配件身份") { [unowned self] in
+            [
+                SettingsSection(footer: "公开源码和本分支的公共构建不包含配件认证材料。Apple 应用签名不能替代配件认证；请使用你有权使用的有效身份。", [
+                    .info("状态", identity == nil ? "尚未导入" : "已载入并通过本地自检"),
+                    .action("导入身份文件夹", icon: ("folder.fill", .systemOrange)) { [unowned self] in
+                        self.chooseAccessoryIdentity()
+                    }
+                ]),
+                SettingsSection("文件夹内容", footer: "选择同时包含 certificate.p7b、leaf.cer、private.x963 的文件夹。验证通过后保存到此 App 的本机 Keychain，原文件保留，不会上传。", []),
+                SettingsSection(footer: "本地自检通过只代表文件和密钥匹配；仍需 iOS 在连接时接受该身份。", [])
+            ]
+        }
+    }
+
+    private func chooseAccessoryIdentity() {
+        guard !running, !waitingForNetwork else {
+            alert("请先停止 CarPlay", "停止后才能导入配件身份。")
+            return
+        }
+        importingAccessoryIdentity = true
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
+        picker.allowsMultipleSelection = false
+        picker.delegate = self
+        (settingsNavigation ?? self).present(picker, animated: true)
+    }
+
+    private func usagePage() -> SettingsPageController {
+        page("使用说明") { [unowned self] in
+            if self.isLocalOnly {
+                return [
+                    SettingsSection("1. 准备身份", [
+                        .guide("导入配件身份", icon: ("key.fill", .systemOrange),
+                               "公开源码不附带配件认证材料。请在「配件身份」导入你有权使用的身份文件夹。IPA 的 Apple 签名与配件身份是两件事。")
+                    ]),
+                    SettingsSection("2. 仅本机启动", [
+                        .guide("优先无需 VPN", icon: ("iphone", .systemBlue),
+                               "「连接方式」选择「仅本机（无需 VPN）」，断开 Wi-Fi 并开启蜂窝数据，再启动 CarPlay。本模式不要求填写 Wi-Fi 预设，也不提供网页共享。"),
+                        .guide("先验证画面与操作", icon: ("hand.tap", .systemTeal),
+                               "此分支仍需真机验证。必须实际出现 CarPlay 画面且触控有效；配件认证或网络探测通过并不代表会话已经成功。")
+                    ]),
+                    SettingsSection("3. 手动备用方式", [
+                        .guide("LocalDevVPN 实验", icon: ("network", .systemOrange),
+                               "纯回环无法建立会话时，保存日志并停止，再启动按默认地址配置的 LocalDevVPN，选择对应备用模式。它不连接远程 VPN 服务器，CarPlay 兼容性仍待实测。"),
+                        .guide("声音与互联网", icon: ("speaker.wave.2.fill", .systemGreen),
+                               "声音使用 iPhone 当前扬声器或蓝牙。导航和音乐的互联网连接由 iOS 管理；要只用蜂窝数据，请保持 Wi-Fi 未连接，并允许相应应用使用蜂窝数据。")
+                    ])
+                ]
+            }
+            return [
                 SettingsSection("1. 先连 Wi-Fi", [
                     .guide("让 iPhone 加入 Wi-Fi", icon: ("wifi", .systemBlue),
                            "路由器、车机 Wi-Fi 或另一台手机的热点都可以。有网、没网都能投屏。运行 CarWithin 的 iPhone 需要实际加入 Wi-Fi，自己开热点不能代替这一步。"),
@@ -2140,16 +2315,28 @@ extension ReceiverViewController {
             var connection: [SettingsRow] = [
                 .page("使用说明", icon: ("book.fill", .systemOrange)) { [unowned self] in self.usagePage() }
             ]
+            if modeControl.selectedSegmentIndex == 1 {
+                connection.append(.page("连接方式", icon: ("network", .systemIndigo), detail: { [unowned self] in
+                    self.networkModeControl.selectedTitle
+                }) { [unowned self] in self.networkModePage() })
+            }
+            connection.append(.page("配件身份", icon: ("key.fill", .systemOrange), detail: { [unowned self] in
+                self.identity == nil ? "需要导入" : "已载入"
+            }) { [unowned self] in self.accessoryIdentityPage() })
             if needsNetworkDetails {
                 connection.append(.page("Wi-Fi 与网络", icon: ("wifi", .systemBlue), detail: { [unowned self] in
                     self.running || self.waitingForNetwork ? nil : "添加"
                 }) { [unowned self] in self.wifiForm(adding: true) })
             }
-            connection.append(.page("Wi-Fi 预设", icon: ("list.bullet", .systemBlue), detail: { WiFiPresetStore.selected()?.ssid ?? "未选择" }) { [unowned self] in self.presetsPage() })
-            connection.append(.control("当前输出", icon: ("point.3.connected.trianglepath.dotted", .systemIndigo), headUnitOutput))
-            connection.append(.page("输出设置", icon: ("slider.horizontal.3", .systemGray)) { [unowned self] in self.headUnitPage() })
-            if outputMode == .browser {
-                connection.append(.page("HTTPS 设置", icon: ("lock.shield", .systemBlue)) { [unowned self] in self.httpsSettingsPage() })
+            if isLocalOnly {
+                connection.append(.info("画面输出", "本机屏幕 · 网页共享关闭"))
+            } else {
+                connection.append(.page("Wi-Fi 预设", icon: ("list.bullet", .systemBlue), detail: { WiFiPresetStore.selected()?.ssid ?? "未选择" }) { [unowned self] in self.presetsPage() })
+                connection.append(.control("当前输出", icon: ("point.3.connected.trianglepath.dotted", .systemIndigo), headUnitOutput))
+                connection.append(.page("输出设置", icon: ("slider.horizontal.3", .systemGray)) { [unowned self] in self.headUnitPage() })
+                if outputMode == .browser {
+                    connection.append(.page("HTTPS 设置", icon: ("lock.shield", .systemBlue)) { [unowned self] in self.httpsSettingsPage() })
+                }
             }
             return [
                 SettingsSection("连接与输出", connection),
@@ -2190,6 +2377,22 @@ extension ReceiverViewController {
 
     fileprivate func displayPage() -> SettingsPageController {
         page("画面") { [unowned self] in
+            if isLocalOnly {
+                let plan = planDisplay(for: nil)
+                return [
+                    SettingsSection("本机画面", footer: "下次启动：\(plan.width)×\(plan.height) · \(plan.fps) FPS · \(plan.codec.displayName)", [
+                        .control("分辨率", icon: ("arrow.up.left.and.arrow.down.right", .systemGreen), resolutionControl),
+                        .control("画面比例", icon: ("aspectratio", .systemGreen), aspectRatioControl),
+                        .control("视频编码", icon: ("film.fill", .systemGreen), codecControl),
+                        .control("帧率", icon: ("gauge.with.dots.needle.67percent", .systemGreen), frameRateControl)
+                    ]),
+                    SettingsSection("操作", [
+                        .control("CarPlay 图标大小", icon: ("square.grid.2x2.fill", .systemPurple), iconSizeControl),
+                        .control("显示触控位置", icon: ("hand.tap", .systemBlue), showTouchesSwitch)
+                    ]),
+                    SettingsSection(footer: editingLockedFooter ?? "初次验证建议使用 H.264、720P、30 FPS。", [])
+                ]
+            }
             if outputMode == .zeeho {
                 return [
                     SettingsSection("极核 6.2 寸", [.info("仪表画面", "1024×480 · H.264 · 25 FPS")]),
@@ -2300,7 +2503,7 @@ extension ReceiverViewController {
 
     fileprivate func soundPage() -> SettingsPageController {
         page("声音") { [unowned self] in
-            guard outputMode == .browser else {
+            guard !isLocalOnly, outputMode == .browser else {
                 let phone = SoundOutput.phone
                 return [SettingsSection(footer: phone.explanation, [.info("声音输出", "由 iPhone 输出")])]
             }
@@ -2856,6 +3059,37 @@ extension ReceiverViewController {
 
 extension ReceiverViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        if importingAccessoryIdentity {
+            importingAccessoryIdentity = false
+            guard let folder = urls.first, !running, !waitingForNetwork else { return }
+            let access = folder.startAccessingSecurityScopedResource()
+            defer { if access { folder.stopAccessingSecurityScopedResource() } }
+            let message: String
+            let imported: Bool
+            do {
+                identity = try AccessoryIdentityStore.importFromDirectory(folder)
+                imported = true
+                message = "配件身份已通过本地自检并保存在 Keychain，可以开始真机连接验证。"
+                log("配件身份已导入并通过本地自检")
+            } catch {
+                if error is AccessoryIdentityStore.ImportFailure {
+                    identity = (try? AccessoryIdentityStore.load()) ?? (try? AccessoryIdentityStore.loadFromBundle())
+                }
+                imported = false
+                message = error.localizedDescription
+            }
+            modeChanged()
+            reloadVisibleSettings()
+            let completion: () -> Void = { [weak self] in
+                self?.alert(imported ? "导入完成" : "无法导入身份", message)
+            }
+            if controller.presentingViewController != nil {
+                controller.dismiss(animated: true, completion: completion)
+            } else {
+                DispatchQueue.main.async(execute: completion)
+            }
+            return
+        }
         guard let url = urls.first, !running else { return }
         let access = url.startAccessingSecurityScopedResource()
         defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -2880,6 +3114,10 @@ extension ReceiverViewController: UIDocumentPickerDelegate {
         } else {
             DispatchQueue.main.async(execute: presentPrompt)
         }
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        importingAccessoryIdentity = false
     }
 }
 

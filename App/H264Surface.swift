@@ -30,6 +30,9 @@ final class H264Surface: UIView {
     private var checkingDisplaySince: TimeInterval?
     private var rendererNeedsRecovery: Bool { display.requiresFlushToResumeDecoding || display.status == .failed }
     var onLog: ((String) -> Void)?
+    /// Fires only after a sample reaches the display layer, not for parameter sets alone.
+    /// Enqueuing a sample still does not prove that the hardware rendered a visible frame.
+    var onFirstFrameEnqueued: (() -> Void)?
     /// Every finger currently on the surface, normalized to the video picture (0…1).
     var onTouches: (([TouchPoint]) -> Void)?
     /// Called whenever the renderer discarded frames and can only resume at a new keyframe.
@@ -207,7 +210,9 @@ final class H264Surface: UIView {
         while display.isReadyForMoreMediaData, !pending.isEmpty {
             let (sample, bytes) = pending.removeFirst(); pendingBytes -= bytes
             display.enqueue(sample)
+            let firstFrame = !hasEnqueuedFrame
             hasEnqueuedFrame = true
+            if firstFrame { onFirstFrameEnqueued?() }
         }
         if pending.isEmpty {
             display.stopRequestingMediaData(); requesting = false

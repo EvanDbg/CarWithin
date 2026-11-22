@@ -45,6 +45,8 @@ final class NativeReceiver {
     private var nightMode: Bool?
     private var generation = UUID()
     private var airPlayIdentity: AirPlayCredentials?
+    private var advertiseServices = false
+    private var localPathProbe: LocalReceiverPathProbe?
     private let videoOutput = VideoOutputServer()
     private let carLife = CarLifeOutput()
     private let zeeho = ZeehoOutput()
@@ -78,6 +80,9 @@ final class NativeReceiver {
         queue.async { [weak self] in
             guard let self else { return }
             self.stopOnQueue()
+            do { try configuration.validateNetworkMode() }
+            catch { self.fail(error.localizedDescription); return }
+            self.advertiseServices = advertise && !configuration.isLocalOnly
             self.videoOutput.onLog = { [weak self] in self?.log($0) }
             self.videoOutput.onAirPlayReady = { [weak self] id in
                 DispatchQueue.main.async { [weak self] in self?.onAirPlayReady?(id) }
@@ -143,7 +148,8 @@ final class NativeReceiver {
                                        preferredViewer: preferredViewer, browserAudio: configuration.browserAudio,
                                        airPlayStreamID: configuration.airPlayStreamID)
             }
-            do { self.airPlayIdentity = advertise ? try AirPlayCredentials() : nil }
+            // Pair-Setup/Pair-Verify need this identity even when Bonjour is off.
+            do { self.airPlayIdentity = try AirPlayCredentials() }
             catch { self.fail("AirPlay 身份创建失败：\(error.localizedDescription)"); return }
             if configuration.audioEnabled {
                 do {
@@ -156,14 +162,33 @@ final class NativeReceiver {
                 } catch { self.fail("无线音频编解码器不可用：\(error.localizedDescription)"); return }
             }
             self.log("请求 \(configuration.width)×\(configuration.height) @ \(configuration.maxFPS) FPS，\(configuration.videoCodec.displayName)；音频\(configuration.audioEnabled ? "已启用（PCM/AAC/Opus）" : "已关闭")")
-            self.listen(configuration: configuration, identity: identity, port: configuration.port, onReady: listening)
+            if configuration.networkMode == .localDevVPN, let localAddress = configuration.listenerAddress {
+                let generation = self.generation
+                let probe = LocalReceiverPathProbe(queue: self.queue, localAddress: localAddress, targetAddress: configuration.address)
+                self.localPathProbe = probe
+                self.log("正在验证 LocalDevVPN 的本机回送路径；这不代表 CarPlay 握手已通过")
+                probe.start { [weak self] success in
+                    guard let self, self.generation == generation else { return }
+                    self.localPathProbe = nil
+                    guard success else {
+                        self.fail("LocalDevVPN 本机回送验证失败。请确认已手动连接 LocalDevVPN 且使用默认地址；不会自动切换到其他 VPN 或网络。")
+                        return
+                    }
+                    self.log("LocalDevVPN 本机回送已验证；接下来尝试实验性 CarPlay 会话")
+                    self.listen(configuration: configuration, identity: identity, port: configuration.port, onReady: listening)
+                }
+            } else {
+                self.listen(configuration: configuration, identity: identity, port: configuration.port, onReady: listening)
+            }
         }
     }
     private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16) -> Void)?) {
         let generation = self.generation
         do {
-            let candidate = try NWListener(using: .tcp, on: port.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any)
-            if let airPlayIdentity {
+            let requestedPort = port.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any
+            let parameters = try ReceiverSocketBinding.parameters(localAddress: configuration.listenerAddress, port: requestedPort)
+            let candidate = try NWListener(using: parameters, on: requestedPort)
+            if advertiseServices, let airPlayIdentity {
                 let features = CarPlayInfo.features(audio: configuration.audioEnabled)
                 let txt: [String: String] = ["deviceid": configuration.deviceID,
                     "features": String(format: "0x%x,0x%x", UInt32(truncatingIfNeeded: features), UInt32(truncatingIfNeeded: features >> 32)),
@@ -178,10 +203,10 @@ final class NativeReceiver {
                 switch state {
                 case .ready:
                     guard let actualPort = candidate.port?.rawValue else { self.fail("监听器未获得端口"); return }
-                    self.log("原生 RTSP 监听器已在端口 \(actualPort) 就绪")
-                    let advertiseDiscovery = self.airPlayIdentity != nil
+                    self.log("原生 RTSP 监听器已在 \(configuration.listenerAddress ?? "所有网络接口"):\(actualPort) 就绪")
+                    let advertiseDiscovery = self.advertiseServices
                     DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
+                        guard let self, self.generation == generation else { return }
                         if advertiseDiscovery {
                             let service = NetService(domain: "local.", type: ReceiverConfiguration.discoveryType,
                                 name: configuration.name, port: Int32(actualPort))
@@ -204,10 +229,18 @@ final class NativeReceiver {
             candidate.newConnectionHandler = { [weak self, weak candidate] connection in
                 guard let self, self.generation == generation, self.listener === candidate,
                       self.connections.count < 8 else { connection.cancel(); return }
+                guard let peerAddress = ReceiverSocketBinding.ipv4Peer(connection.endpoint) else {
+                    self.log("控制连接需要 IPv4 对端")
+                    connection.cancel(); return
+                }
+                guard configuration.networkMode.allowsControlPeer(peerAddress) else {
+                    self.log("本机模式拒绝非预期控制对端：\(peerAddress)")
+                    connection.cancel(); return
+                }
                 let id = UUID(); self.connections[id] = connection
                 let state = SessionState(credentials: self.airPlayIdentity)
                 self.sessions[id] = state
-                if case .hostPort(let host, _) = connection.endpoint { state.peerAddress = "\(host)" }
+                state.peerAddress = peerAddress
                 connection.stateUpdateHandler = { [weak self, weak connection] update in
                     guard let self, let connection else { return }
                     switch update {
@@ -317,6 +350,8 @@ final class NativeReceiver {
     private func stopOnQueue() {
         DispatchQueue.main.async { [weak self] in self?.discoveryService?.stop(); self?.discoveryService = nil }
         generation = UUID(); listener?.cancel(); listener = nil
+        localPathProbe?.stop(); localPathProbe = nil
+        advertiseServices = false
         videoOutput.stop()
         carLife.stop()
         zeeho.stop()
@@ -397,7 +432,8 @@ final class NativeReceiver {
             }
             if state.media == nil {
                 let media = CarPlayMediaSession(queue: queue, secret: secret, peerAddress: state.peerAddress,
-                                                audioEnabled: configuration.audioEnabled, hevc: configuration.videoCodec == .h265)
+                                                audioEnabled: configuration.audioEnabled, hevc: configuration.videoCodec == .h265,
+                                                localAddress: configuration.listenerAddress)
                 media.onLog = { [weak self] in self?.log($0) }
                 if configuration.browserAudio {
                     media.onBrowserAudio = { [weak self] stream, buffer, stamp in
@@ -414,7 +450,7 @@ final class NativeReceiver {
                     #endif
                     let keyframe = Self.containsRandomAccess(data, codec: codec)
                     if keyframe { self.keyframeArrived() }
-                    self.videoOutput.append(data, codec: codec)
+                    if configuration.videoOutputPort != nil { self.videoOutput.append(data, codec: codec) }
                     if configuration.zeehoAddress != nil { self.zeeho.append(data, codec: codec, keyframe: keyframe) }
                     if configuration.ninebotAddress != nil { self.ninebot.append(data, codec: codec, keyframe: keyframe) }
                     if configuration.tailingAddress != nil { self.tailing.append(data, codec: codec) }

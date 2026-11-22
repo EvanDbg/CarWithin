@@ -1,14 +1,44 @@
 import Foundation
 import Security
 
-/// Imports a local test identity once, then keeps it in this device's Keychain.
-/// It makes a best-effort attempt to remove the raw private-key staging file.
+/// Imports a local accessory identity into this device's Keychain.
+/// Only the legacy Documents staging import removes its original files.
 enum AccessoryIdentityStore {
     private static let service = "local.tds.carkit.mfi-identity"
     private static let chainAccount = "certificate-chain"
     private static let leafAccount = "leaf-certificate"
     private static let keyTag = Data("local.tds.carkit.mfi-identity.private-key".utf8)
     private static let maximumIdentityFileSize = 65_536
+
+    private struct StoredIdentity {
+        let chain: Data
+        let leaf: Data
+        let key: SecKey
+    }
+
+    /// A failed replacement can leave the stored identity unavailable. The UI
+    /// must reload it in that case instead of retaining its old in-memory status.
+    enum ImportFailure: LocalizedError {
+        case notSaved(String)
+        case previousRestored(String)
+        case recoveryFailed(importError: String, recoveryError: String)
+
+        var requiresIdentityReload: Bool {
+            if case .previousRestored = self { return false }
+            return true
+        }
+
+        var errorDescription: String? {
+            switch self {
+            case .notSaved(let message):
+                return "身份未能保存到 Keychain，请重试。\(message)"
+            case .previousRestored(let message):
+                return "新身份未能保存；原身份已恢复并通过自检，可继续使用。\(message)"
+            case .recoveryFailed(let importError, let recoveryError):
+                return "新身份保存失败，且无法确认原身份已恢复。请重新导入有效身份。保存错误：\(importError)；恢复错误：\(recoveryError)"
+            }
+        }
+    }
 
     static func load() throws -> AccessoryIdentity {
         let chain = try readData(account: chainAccount)
@@ -34,10 +64,23 @@ enum AccessoryIdentityStore {
 
     static func importFromDocuments() throws -> AccessoryIdentity {
         let directory = try stagingDirectory()
+        let identity = try importFromDirectory(directory)
+        for name in ["certificate.p7b", "leaf.cer", "private.x963"] {
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+        }
+        try? FileManager.default.removeItem(at: directory)
+        return identity
+    }
+
+    /// Validates a user-selected folder, then stores the identity in this app's Keychain.
+    /// Never deletes or modifies the user's original files.
+    static func importFromDirectory(_ directory: URL) throws -> AccessoryIdentity {
+        guard try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+            throw StoreError.invalidStagingFile("请选择包含三个身份文件的文件夹")
+        }
         let chainURL = directory.appendingPathComponent("certificate.p7b")
         let leafURL = directory.appendingPathComponent("leaf.cer")
         let keyURL = directory.appendingPathComponent("private.x963")
-        defer { try? FileManager.default.removeItem(at: keyURL) }
 
         let chain = try readBounded(chainURL)
         let leaf = try readBounded(leafURL)
@@ -45,18 +88,41 @@ enum AccessoryIdentityStore {
         defer { keyData.resetBytes(in: 0..<keyData.count) }
 
         _ = try AccessoryIdentity(certificateChain: chain, leafCertificate: leaf, privateKeyX963: keyData)
+        // Keep a SecKey reference, never an exported copy of the previous key.
+        // Unexpected Keychain read errors abort before changing any stored item.
+        let previous = try storedIdentity()
         do {
             try replacePrivateKey(keyData)
             try replaceData(chain, account: chainAccount)
             try replaceData(leaf, account: leafAccount)
-            let identity = try load()
-            try? FileManager.default.removeItem(at: chainURL)
-            try? FileManager.default.removeItem(at: leafURL)
-            try? FileManager.default.removeItem(at: directory)
-            return identity
+            return try load()
         } catch {
+            let importError = error.localizedDescription
+            if let previous {
+                do {
+                    try replacePrivateKey(previous.key)
+                    try replaceData(previous.chain, account: chainAccount)
+                    try replaceData(previous.leaf, account: leafAccount)
+                    _ = try load()
+                } catch {
+                    // Preserve the remaining items for recovery; do not erase
+                    // the previous identity again after a failed rollback.
+                    throw ImportFailure.recoveryFailed(importError: importError,
+                        recoveryError: error.localizedDescription)
+                }
+                throw ImportFailure.previousRestored(importError)
+            }
             deleteStoredIdentity()
-            throw error
+            throw ImportFailure.notSaved(importError)
+        }
+    }
+
+    private static func storedIdentity() throws -> StoredIdentity? {
+        do {
+            return StoredIdentity(chain: try readData(account: chainAccount),
+                leaf: try readData(account: leafAccount), key: try readPrivateKey())
+        } catch StoreError.identityMissing {
+            return nil
         }
     }
 
@@ -98,7 +164,12 @@ enum AccessoryIdentityStore {
             if let error { throw error.takeRetainedValue() }
             throw StoreError.invalidPrivateKey
         }
-        SecItemDelete(privateKeyQuery() as CFDictionary)
+        try replacePrivateKey(key)
+    }
+
+    private static func replacePrivateKey(_ key: SecKey) throws {
+        let deleted = SecItemDelete(privateKeyQuery() as CFDictionary)
+        if deleted != errSecItemNotFound { try requireSuccess(deleted) }
         var query = privateKeyQuery()
         query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         query[kSecValueRef] = key
@@ -119,7 +190,8 @@ enum AccessoryIdentityStore {
 
     private static func replaceData(_ data: Data, account: String) throws {
         let base = dataQuery(account: account)
-        SecItemDelete(base as CFDictionary)
+        let deleted = SecItemDelete(base as CFDictionary)
+        if deleted != errSecItemNotFound { try requireSuccess(deleted) }
         var query = base
         query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         query[kSecValueData] = data
