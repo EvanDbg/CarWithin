@@ -184,10 +184,10 @@ final class NativeReceiver {
     }
     private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16) -> Void)?) {
         let generation = self.generation
+        let context = "mode=\(configuration.networkMode.rawValue), bind=\(configuration.listenerAddress ?? "所有网络接口"), port=\(port.map { String($0) } ?? "自动")"
         do {
             let requestedPort = port.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any
-            let parameters = try ReceiverSocketBinding.parameters(localAddress: configuration.listenerAddress, port: requestedPort)
-            let candidate = try NWListener(using: parameters, on: requestedPort)
+            let candidate = try ReceiverSocketBinding.makeListener(localAddress: configuration.listenerAddress, port: requestedPort)
             if advertiseServices, let airPlayIdentity {
                 let features = CarPlayInfo.features(audio: configuration.audioEnabled)
                 let txt: [String: String] = ["deviceid": configuration.deviceID,
@@ -202,7 +202,10 @@ final class NativeReceiver {
                 guard let self, let candidate, self.generation == generation, self.listener === candidate else { return }
                 switch state {
                 case .ready:
-                    guard let actualPort = candidate.port?.rawValue else { self.fail("监听器未获得端口"); return }
+                    guard let actualPort = candidate.port?.rawValue else {
+                        self.fail("监听器未获得端口 [\(context)]；已停止，不会自动重试，请手动重试。")
+                        return
+                    }
                     self.log("原生 RTSP 监听器已在 \(configuration.listenerAddress ?? "所有网络接口"):\(actualPort) 就绪")
                     let advertiseDiscovery = self.advertiseServices
                     DispatchQueue.main.async { [weak self] in
@@ -222,7 +225,7 @@ final class NativeReceiver {
                         self.log("端口 \(port!) 已被占用，正在申请可用端口")
                         candidate.cancel(); self.listener = nil
                         self.listen(configuration: configuration, identity: identity, port: nil, onReady: onReady)
-                    } else { self.fail("监听器失败：\(error.localizedDescription)") }
+                    } else { self.fail("监听器失败 [\(context)]：\(error.localizedDescription)；已停止，不会自动重试，请手动重试。") }
                 default: break
                 }
             }
@@ -260,8 +263,8 @@ final class NativeReceiver {
             if port != nil, case .posix(.EADDRINUSE) = error {
                 log("端口 \(port!) 已被占用，正在申请可用端口")
                 listen(configuration: configuration, identity: identity, port: nil, onReady: onReady)
-            } else { fail("无法创建监听器：\(error.localizedDescription)") }
-        } catch { fail("无法创建监听器：\(error)") }
+            } else { fail("无法创建监听器 [\(context)]：\(error.localizedDescription)；已停止，不会自动重试，请手动重试。") }
+        } catch { fail("无法创建监听器 [\(context)]：\(error)；已停止，不会自动重试，请手动重试。") }
     }
     private func fail(_ message: String) {
         log(message); stopOnQueue()

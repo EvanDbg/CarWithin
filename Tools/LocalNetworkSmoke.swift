@@ -102,28 +102,108 @@ enum LocalNetworkSmoke {
         try require(result == expected, "TCP echoed nonce")
     }
 
-    static func testControlBinding() throws {
-        let ready = DispatchSemaphore(value: 0)
-        let listener = try NWListener(using: ReceiverSocketBinding.parameters(localAddress: "127.0.0.1"), on: .any)
-        var accepted: NWConnection?
+    /// A constructor returning successfully is not evidence that a socket bound.
+    static func startListener(_ listener: NWListener) throws -> NWListener.State {
+        let completed = DispatchSemaphore(value: 0)
+        var outcome: NWListener.State?
+        listener.stateUpdateHandler = { state in
+            guard outcome == nil else { return }
+            switch state {
+            case .ready, .failed:
+                outcome = state
+                completed.signal()
+            default: break
+            }
+        }
+        listener.start(queue: queue)
+        try require(completed.wait(timeout: .now() + 3) == .success, "control listener did not reach ready or failed")
+        guard let result = queue.sync(execute: { outcome }) else { throw Failure(description: "missing listener state") }
+        return result
+    }
+
+    /// Keeps a loopback TCP port occupied until the caller closes the descriptor.
+    static func reserveTCPPort() throws -> (Int32, UInt16) {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        try require(fd >= 0, "reservation TCP socket")
+        do {
+            var address = try endpoint("127.0.0.1", 0)
+            let bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            try require(bound == 0, "reservation TCP bind")
+            try require(Darwin.listen(fd, 1) == 0, "reservation TCP listen")
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let named = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+            }
+            try require(named == 0, "reservation TCP getsockname")
+            let port = UInt16(bigEndian: address.sin_port)
+            try require(port != 0, "reservation TCP has no port")
+            return (fd, port)
+        } catch {
+            close(fd)
+            throw error
+        }
+    }
+
+    static func testControlBinding(requestedPort: NWEndpoint.Port = .any) throws -> UInt16 {
+        let listener = try ReceiverSocketBinding.makeListener(localAddress: "127.0.0.1", port: requestedPort)
+        var accepted: [NWConnection] = []
         listener.newConnectionHandler = { connection in
-            accepted = connection
+            accepted.append(connection)
             connection.start(queue: queue)
             connection.receive(minimumIncompleteLength: 12, maximumLength: 12) { bytes, _, _, _ in
                 connection.send(content: bytes, completion: .contentProcessed { _ in })
             }
         }
-        listener.stateUpdateHandler = { state in
-            if case .ready = state { ready.signal() }
-            if case .failed = state { ready.signal() }
+        defer { queue.sync { listener.cancel(); accepted.forEach { $0.cancel() } } }
+        let state = try startListener(listener)
+        guard case .ready = state else { throw Failure(description: "control listener startup failed: \(state)") }
+        guard let port = listener.port?.rawValue, port != 0 else { throw Failure(description: "control listener has no port") }
+        if requestedPort != .any {
+            try require(port == requestedPort.rawValue, "control listener ignored the requested fixed port")
         }
-        listener.start(queue: queue)
-        defer { queue.sync { listener.cancel(); accepted?.cancel() } }
-        try require(ready.wait(timeout: .now() + 3) == .success, "control listener startup")
-        guard let port = listener.port?.rawValue else { throw Failure(description: "control listener has no port") }
         try tcpRoundTrip(port: port, expected: Data("control-test".utf8))
         try requireNonLoopbackRefused(port: port)
-        print("PASS: bound Network.framework control socket round trip")
+        print("PASS: actual control-listener factory reached ready and echoed TCP (requested=\(requestedPort), actual=\(port))")
+        return port
+    }
+
+    static func testFixedControlPort() throws {
+        // Avoid assuming that port 7000 is free on a Mac running AirPlay Receiver.
+        let (reservation, port) = try reserveTCPPort()
+        close(reservation)
+        _ = try testControlBinding(requestedPort: NWEndpoint.Port(rawValue: port)!)
+    }
+
+    static func testOccupiedControlPort() throws {
+        let (reservation, occupiedPort) = try reserveTCPPort()
+        defer { close(reservation) }
+        var bindError: NWError?
+        do {
+            let listener = try ReceiverSocketBinding.makeListener(localAddress: "127.0.0.1", port: NWEndpoint.Port(rawValue: occupiedPort)!)
+            listener.newConnectionHandler = { $0.cancel() }
+            defer { queue.sync { listener.cancel() } }
+            let state = try startListener(listener)
+            guard case .failed(let error) = state else {
+                throw Failure(description: "control listener unexpectedly bound an occupied port: \(state)")
+            }
+            bindError = error
+        } catch let error as NWError {
+            // NativeReceiver also handles a synchronous EADDRINUSE. EINVAL is
+            // a parameter bug and must never count as a successful collision test.
+            bindError = error
+        }
+        guard let error = bindError, case .posix(.EADDRINUSE) = error else {
+            throw Failure(description: "occupied control port did not report EADDRINUSE: \(String(describing: bindError))")
+        }
+        // Exercise the same fixed-port -> automatic-port factory calls used by
+        // NativeReceiver, while the original port remains occupied.
+        let fallbackPort = try testControlBinding()
+        try require(fallbackPort != occupiedPort, "automatic control port reused the occupied port")
+        print("PASS: fixed-port collision reports EADDRINUSE and automatic fallback remains loopback-only")
     }
 
     static func testMediaTCP() throws {
@@ -224,7 +304,9 @@ enum LocalNetworkSmoke {
     }
 
     static func main() throws {
-        try testControlBinding()
+        _ = try testControlBinding()
+        try testFixedControlPort()
+        try testOccupiedControlPort()
         try testMediaTCP()
         try testAudioUDP()
         try testTimingUDP()

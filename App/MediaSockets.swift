@@ -40,6 +40,17 @@ enum ReceiverSocketBinding {
         }
         return parameters
     }
+
+    static func makeListener(localAddress: String?, port: NWEndpoint.Port = .any) throws -> NWListener {
+        let parameters = try Self.parameters(localAddress: localAddress, port: port)
+        if localAddress != nil {
+            // requiredLocalEndpoint already supplies both address and port.
+            // Passing a fixed `on:` port as well selects the conflicting
+            // create-with-port API and can throw EINVAL before start().
+            return try NWListener(using: parameters)
+        }
+        return try NWListener(using: parameters, on: port)
+    }
 }
 
 /// A short nonce round trip verifies that a requested virtual peer really
@@ -63,8 +74,7 @@ final class LocalReceiverPathProbe {
     func start(completion: @escaping (Bool) -> Void) {
         stop(); self.completion = completion
         do {
-            let parameters = try ReceiverSocketBinding.parameters(localAddress: localAddress)
-            let listener = try NWListener(using: parameters, on: .any)
+            let listener = try ReceiverSocketBinding.makeListener(localAddress: localAddress)
             self.listener = listener
             listener.newConnectionHandler = { [weak self] connection in
                 guard let self, self.completion != nil, self.accepted == nil,

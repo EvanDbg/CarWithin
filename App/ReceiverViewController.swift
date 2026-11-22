@@ -129,6 +129,23 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private var lightLevel = 0
     private var restartingAutomatically = false
     private var pendingRestartReason: String?
+    private enum ReceiverStartSource: String {
+        case button
+        case debugLaunch = "debug-launch"
+        case networkReady = "network-ready"
+        case networkChanged = "network-change"
+        case screenReconfiguration = "screen-reconfigure"
+        case browserPerformance = "browser-performance"
+        case foregroundPerformance = "foreground-performance"
+    }
+    private struct ScheduledRestart {
+        let id: UUID
+        let connectionMode: Int
+        let networkMode: ReceiverNetworkMode
+        let work: DispatchWorkItem
+    }
+    private var scheduledRestart: ScheduledRestart?
+    private var startAttempt = 0
     private let appearanceControl = ChoiceMenu(items: ReceiverConfiguration.Appearance.allCases.map(\.title))
     /// CarPlay keys under the inline video.
     private let controlBar = UIStackView()
@@ -269,7 +286,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             testSameDeviceTransport()
         } else if !launchedTransportTest, ProcessInfo.processInfo.arguments.contains("--test-local-transport") {
             launchedTransportTest = true
-            modeControl.selectedSegmentIndex = 1; modeChanged(); toggleReceiver()
+            modeControl.selectedSegmentIndex = 1; modeChanged(); startReceiver(source: .debugLaunch)
         } else if !launchedTransportTest, let index = ProcessInfo.processInfo.arguments.firstIndex(of: "--open-settings") {
             // Screenshots: --open-settings [display|screens|wifi|presets|vehicle|sound|output|web|log|lab|about|usage]
             launchedTransportTest = true
@@ -733,6 +750,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         wifiPathMonitor.cancel()
         internetPathMonitor.cancel()
         networkStartupTask?.cancel()
+        scheduledRestart?.work.cancel()
         localStartupDeadline?.cancel()
     }
 
@@ -1429,7 +1447,24 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }
     }
     @objc private func toggleReceiver() {
-        if running || waitingForNetwork { stop(); return }
+        if running || waitingForNetwork {
+            log("停止请求：来源=button，最近启动请求 #\(startAttempt)")
+            stop()
+            return
+        }
+        startReceiver(source: .button)
+    }
+
+    /// Internal callers only request a start; they must never toggle a newer
+    /// running session off when an asynchronous callback arrives late.
+    private func startReceiver(source: ReceiverStartSource) {
+        guard !running, !waitingForNetwork else {
+            log("忽略重复启动请求：来源=\(source.rawValue)，会话已启动或正在等待网络")
+            return
+        }
+        cancelScheduledRestart(reason: "收到新的启动请求（\(source.rawValue)）")
+        startAttempt += 1
+        log("启动请求 #\(startAttempt)：来源=\(source.rawValue)，设备模式=\(modeControl.selectedSegmentIndex)，网络模式=\(effectiveNetworkMode.rawValue)")
         if !restartingAutomatically { networkRestartCount = 0 }
         clearStartupHint()
         updateCheckTask?.cancel()
@@ -1588,7 +1623,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
                     self.modeControl.isEnabled = true
                     self.setEditing(true)
                     self.restartingAutomatically = self.networkRestartCount > 0
-                    self.toggleReceiver()
+                    self.startReceiver(source: .networkReady)
                     self.restartingAutomatically = false
                     return
                 }
@@ -1620,7 +1655,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
                 self.log("启动期间 Wi-Fi 已切换或恢复，使用当前地址重新连接 CarPlay")
                 self.stop()
                 self.restartingAutomatically = true
-                self.toggleReceiver()
+                self.startReceiver(source: .networkChanged)
                 self.restartingAutomatically = false
                 return
             }
@@ -1628,6 +1663,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }
 
     private func stop() {
+        cancelScheduledRestart(reason: "接收会话已停止")
         localStartupID = nil
         localStartupDeadline?.cancel(); localStartupDeadline = nil
         networkStartupTask?.cancel()
@@ -1705,6 +1741,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }
     @objc private func modeChanged() {
         if UIDevice.current.userInterfaceIdiom == .phone { modeControl.selectedSegmentIndex = 1 }
+        if let pending = scheduledRestart,
+           pending.connectionMode != modeControl.selectedSegmentIndex || pending.networkMode != effectiveNetworkMode {
+            cancelScheduledRestart(reason: "设备或网络模式已改变")
+        }
         UserDefaults.standard.set(modeControl.selectedSegmentIndex, forKey: "connectionMode")
         let local = modeControl.selectedSegmentIndex == 1
         let remote = modeControl.selectedSegmentIndex == 2
@@ -1778,7 +1818,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         if running, keepAliveSwitch.isOn { keepAlive.start() }
         if let reason = pendingRestartReason {
             pendingRestartReason = nil
-            restartCarPlay(reason: reason, forPerformance: true)
+            restartCarPlay(reason: reason, forPerformance: true, source: .foregroundPerformance)
         } else {
             scheduleScreenAdaptation()
         }
@@ -1832,7 +1872,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         if wanted.codec != live.codec { changes.append("\(live.codec.displayName) → \(wanted.codec.displayName)") }
         if wanted.iconWidthMM != live.iconWidthMM { changes.append("图标大小") }
         guard !changes.isEmpty else { return }
-        restartCarPlay(reason: "跟随主接收屏幕（\(changes.joined(separator: "，"))）")
+        restartCarPlay(reason: "跟随主接收屏幕（\(changes.joined(separator: "，"))）", source: .screenReconfiguration)
     }
     private func browserStruggling(peer: String, reason: String) {
         log("浏览器 \(peer) 持续卡顿（\(reason)）")
@@ -1846,26 +1886,45 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         guard UIApplication.shared.applicationState == .active else {
             pendingRestartReason = reason; log("回到 CarWithin 后重启：\(reason)"); return
         }
-        restartCarPlay(reason: reason, forPerformance: true)
+        restartCarPlay(reason: reason, forPerformance: true, source: .browserPerformance)
     }
-    private func restartCarPlay(reason: String, forPerformance: Bool = false) {
+    private func cancelScheduledRestart(reason: String) {
+        guard let pending = scheduledRestart else { return }
+        scheduledRestart = nil
+        pending.work.cancel()
+        log("已取消待执行的自动重启：\(reason)")
+    }
+
+    private func restartCarPlay(reason: String, forPerformance: Bool = false, source: ReceiverStartSource) {
+        guard scheduledRestart == nil else { return }
         guard running, modeControl.selectedSegmentIndex == 1 else { return }
         if forPerformance {
             guard autoRestarts < 2 else { return }
             autoRestarts += 1
         }
-        log("自动重启 CarPlay：\(reason)")
+        log("排程自动重启：来源=\(source.rawValue)，原因=\(reason)")
         let keepScreen = reportedScreen, keepViewer = primaryViewer, level = lightLevel, count = autoRestarts
+        // stop() cancels any previous restart. Create this request only after
+        // it returns, so the intentional stop does not cancel its own start.
         stop()
         statusLabel.text = "正在按新的画面设置重启 CarPlay…"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            guard let self, !self.running else { return }
+        let id = UUID()
+        let connectionMode = modeControl.selectedSegmentIndex
+        let networkMode = effectiveNetworkMode
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.scheduledRestart?.id == id else { return }
+            self.scheduledRestart = nil
+            guard !self.running, !self.waitingForNetwork,
+                  self.modeControl.selectedSegmentIndex == connectionMode,
+                  self.effectiveNetworkMode == networkMode else { return }
             self.reportedScreen = keepScreen; self.primaryViewer = keepViewer
             self.lightLevel = level; self.autoRestarts = count
             self.restartingAutomatically = true
-            self.toggleReceiver()
+            self.startReceiver(source: source)
             self.restartingAutomatically = false
         }
+        scheduledRestart = ScheduledRestart(id: id, connectionMode: connectionMode, networkMode: networkMode, work: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
     /// The car button on the CarPlay home screen: 120 px, a white car on the app's blue.
