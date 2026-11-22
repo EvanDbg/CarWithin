@@ -28,9 +28,9 @@ struct ListenerSmoke {
         let receiver = NativeReceiver()
         receiver.onLog = { print($0) }
         receiver.onFailure = { print("FAIL: listener"); exit(3) }
-        receiver.onListening = { actual, publicKey in
+        receiver.onListening = { actual, pairingIdentifier in
             guard actual != occupiedPort else { print("FAIL: did not fall back"); exit(4) }
-            guard publicKey.count == 32 else { print("FAIL: missing receiver public key"); exit(9) }
+            guard !pairingIdentifier.isEmpty else { print("FAIL: missing receiver pairing identifier"); exit(9) }
             let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: actual)!, using: .tcp)
             connection.stateUpdateHandler = { state in
                 if case .ready = state {

@@ -2,7 +2,7 @@
 
 这个分支尝试让同一台 iPhone 生成、接收、显示并操作 CarPlay，同时由蜂窝网络为地图、音乐等联网功能提供数据。默认使用本机回环连接，不要求安装外部 VPN，不把 CarPlay 画面通过 HTTP 服务分享给其他设备。
 
-**这是需要真机验证的实现方案。build 17 已有监听器就绪、配件认证和识别成功的真机反馈，但尚未完成控制连接、媒体和画面验证。编译成功、核心测试通过或普通 socket 回送成功，都不能证明完整 CarPlay 会话可用。下方验收矩阵中的完整使用场景仍待验证。**
+**这是需要真机验证的实现方案。build 18 的回环和 LocalDevVPN 真机测试均已完整等待 45 秒而未收到控制连接；配件认证和识别成功，媒体与画面尚未建立。build 19 核对会话身份字段的另一种取值。编译成功、核心测试通过或普通 socket 回送成功，都不能证明完整 CarPlay 会话可用。下方验收矩阵中的完整使用场景仍待验证。**
 
 ## 基线与应用身份
 
@@ -14,31 +14,55 @@
 | 本分支基线 | `4cdc0f3d0d319bb5fc957932cf1cacf272c02b50`，包含该版本后的 README 更新 |
 | 显示名称 | CarWithin Local |
 | Bundle ID | `com.evandbg.carwithin.local` |
-| 本分支应用版本 | 1.0.3，build 18 |
+| 本分支应用版本 | 1.0.3，build 19 |
 | 最低部署版本 | iOS 16.0；实际兼容性仍需按设备与系统验证 |
 
 使用独立 Bundle ID 是为了和上游安装版本区分。新的签名或 Bundle ID 通常不会自动继承旧 App 的容器与 Keychain 身份，安装本分支后应查看其身份状态。
 
-## build 18：补齐 StartSession 公钥和阶段诊断
+## build 19：核对 StartSession 配对标识
 
-build 17 的真机日志确认了以下阶段。反馈未包含完整 iOS 版本和当时的 Wi-Fi 关联状态，因此这些观察还不能被记为“纯蜂窝已通过”。
+build 18 的最新反馈已覆盖完整 45 秒等待窗口。两种模式都没有“控制入站”；之前 8–13 秒手动停止的观察局限已由这两轮补齐。反馈仍未包含完整 iOS 版本和 Wi-Fi 关联状态，因此不能据此给某个具体 iOS 或纯蜂窝状态作兼容性结论。
 
 | 阶段 | 直接回环 | LocalDevVPN |
 | --- | --- | --- |
 | RTSP 监听器 | `127.0.0.1:7000` 就绪 | `10.7.1.1:7000` 就绪，App 回送探测通过 |
 | iAP2 配件认证和识别 | iOS 接受 | iOS 接受 |
-| StartSession | 已向系统发送，目标 `127.0.0.1:7000` | 已向系统发送，目标 `10.7.0.1:7000` |
-| 控制连接、画面 | 停止前未观察到就绪的控制连接 | 停止前未观察到就绪的控制连接 |
+| StartSession | 向 `127.0.0.1:7000` 请求，随后重试 | 向 `10.7.0.1:7000` 请求，随后重试 |
+| 完整观察窗口 | 21:47:52–21:48:37，45 秒 | 21:49:06–21:49:51，45 秒 |
+| 控制连接、画面 | 没有控制入站，自动超时 | 没有控制入站，自动超时 |
 
-排查发现 `0x4301` 的公钥字段此前为空。本机模式关闭了包含 `pk` 的 AirPlay Bonjour 广告，因此此版本将 `NativeReceiver` 同一个 `AirPlayCredentials` 身份的 32 字节 Ed25519 公钥传入启动请求，编码为 64 个小写十六进制字符及 NUL 结束符。监听器就绪时将实际端口和公钥作为不可变值交给会话，同一次启动的重试复用已编码请求。本机模式在创建虚拟配件前拒绝缺失或长度错误的公钥。
+“没有控制入站”是 App 的观察，不能替代抓包，也不能单独区分系统未发起连接、路由阻断或接口资格未通过。MFi 认证已被 iOS 接受，因此这份日志不支持要求用户重新生成那三个认证文件。
 
-这把 AirPlay 公钥与导入的 MFi P-256 配件身份用途不同。MFi 认证已成功的设备无需为本次修正重新准备 `certificate.p7b`、`leaf.cer` 或 `private.x963`。传给另一台 iPad 接收器的原 Wi-Fi 路径继续沿用远端广告，不把发送手机自己的公钥错误地当作远端身份。
+### 为什么尝试配对标识，而不是沿用 build 18 的字段解释
 
-字段含义参考本项目已参考的 [DiPlay StartSession 编码器](https://github.com/shihabal3amri/DiPlay/blob/615b32ce0b40cd0b99ce94ba23a512001553684f/shared/src/main/java/com/shilapi/xcertplay/iap2/message/Iap2Messages.kt)。它将 group 0 视为 wired 属性，group 1 视为 wireless 属性。当前本机实验仍只发送原有 group 0 和 IPv4 地址；去掉无线凭据并不自动意味着 iOS 会接受这些地址作为通用 CarPlay 网络。补齐公钥旨在排除一个具体协议缺项，是否还受传输类型、接口、地址族或发现条件限制，仍需真机证据。
+build 18 参考 DiPlay，将 `0x4301` field 4 当作接收器 Ed25519 公钥并编码为 64 字符 hex。**此前把这视为协议确定要求，依据不充分。** 新核对的 iOS 26.1 静态处理链如下：
 
-新增诊断将区分“监听器受理入站连接”“对端拒绝”“连接等待/失败”“连接就绪”，并记录配置验证或设置保存导致的启动前退出。`0x4300` 日志将 wired/wireless 可用性与 ACC 端点传输类型区分；发送 `0x4301` 仅表示请求已发送，不表示 iOS 已接受。
+| 处理阶段 | 实际数据流 |
+| --- | --- |
+| CoreAccessories 解析 `0x4301` | field 4 以字符串解析，传入 `platform_CarPlay_startSession` 的第 10 个参数 |
+| CoreAccessories / carkitd / CarKit | 以历史名称 `publicKey` 传到 `CARSessionRequestHost.publicKey` |
+| APTransport 创建接收端属性 | `host.publicKey` 被赋给 `publicCUAirPlayPairingIdentity` |
+| APTransport 属性与 TXT 映射 | 上述身份属性对应 `pi`；独立的 `publicKey` 属性才对应 `pk` |
 
-复测时优先用直接回环方式单次启动，留在前台等待自动结果。没有就绪控制连接时约 45 秒会停止；若已建立控制连接但一直没有视频样本，总启动期限为 75 秒。避免在 10–30 秒内反复手动停止，保留从启动请求到最终结果的完整日志，并附 iOS 完整版本、App build、Wi-Fi 是否关联或完全关闭。
+以上来自公开反编译的固定 iOS 26.1 / 23B85 仓库提交 `90aa0cfe59d9682b4265e1354c8b19ec3c7823ab`：[field 4 解析及传递](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/CoreAccessories.framework/Support/CoreAccessories/CoreAccessories_15.mm)、[平台层字段](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/CoreAccessories.framework/Support/CoreAccessories/CoreAccessories_08.mm)、[carkitd](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/usr/libexec/carkitd/carkitd.mm)、[CarKit host](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/CarKit.framework/CarKit/CARSessionRequestHost.mm)、[APTransport 赋值](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APTransport.mm)、[pi/pk 映射](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APTransport_02.mm)。这是静态实现证据，不是 Apple 对私有接口的兼容性承诺，也没有证明当前手机已经进入这条分支。
+
+独立实现 [LIVI 的 helper](https://github.com/f-io/LIVI/blob/4451f8f8b927032dd59708ab2f1591548410139e/native/crates/livi-helper/src/lib.rs) 将 `start.pairing_id` 填入名为 `public_key` 的配置，[wired/wireless StartSession 构造](https://github.com/f-io/LIVI/blob/4451f8f8b927032dd59708ab2f1591548410139e/native/crates/livi-helper-stack/src/bringup.rs) 都使用这个值。另一方面，[DiPlay](https://github.com/shihabal3amri/DiPlay/blob/615b32ce0b40cd0b99ce94ba23a512001553684f/shared/src/main/java/com/shilapi/xcertplay/orchestration/CarPlayController.kt) 确实使用真实公钥 hex，而其配对 ID 是另一个 UUID。不同实现的冲突仍然存在；不能将某项目整体成功等同于“只改变 field 4 的对照实验”。
+
+### 这版具体改变什么
+
+`NativeReceiver` 使用活动 `AirPlayCredentials.identifier`，与该对象用于 PairSetup/PairVerify 的持久标识一致。本 App 首次建立身份时生成 UUID，但此次升级不额外生成标识或密钥。监听器在自己的队列取得实际端口和标识快照，通过已有启动 token 检查传入 `SameDeviceProbe`；iAP2 建链前将字段编码为原样 UTF-8 加 NUL，同次启动重试复用编码。
+
+本地实现检查非空、UTF-8 字节数不超过 252、无空白或控制字符，且不强制标识必须为 UUID。远端 iPad 的原请求继续保留未知身份空字段，不把发送手机的身份当作远端身份。field 4 值属于 AirPlay 会话身份，和导入的 MFi P-256 配件认证材料是不同用途；已经成功载入并认证的材料无需重建。
+
+**本次属于有依据的单变量试验，不是已确定根因的修复。** 地址/绑定、端口、ACC 传输类型、地址组、Wi-Fi 凭据省略、Bonjour/HTTP 共享策略、重试和超时都不改变。`0x4300` 可用性为 1 不表示回环或 utun 已成为系统认可的 CarPlay 媒体接口；没有 Wi-Fi 凭据也不自动满足有线接口条件。
+
+每次启动新增系统版本、App build，以及 field 4 使用 `pi` 的语义和长度日志，不打印标识全文、证书或私钥。复测按同样网络条件单次启动，等待自动结果；无控制连接约 45 秒停止，控制已建立但没有视频样本时总启动期限为 75 秒。请附系统设置中 Wi-Fi 的实际状态和蜂窝是否可用。
+
+若新版本仍无控制入站，下一步需要系统侧证据：可按 [Apple 的设备日志指引](https://developer.apple.com/documentation/xcode/acquiring-crash-reports-and-diagnostic-logs) 用 Mac“控制台”选择已连接且信任的 iPhone，开始采集并复现一次，记录准确时间，然后分别查找 `airplayd`、`carkitd`、`APBrowserCarSessionHelper`、`CarPlay` 相关消息。不同系统的进程名和可见日志可能不同；USB 接线会改变测试环境，应明确记录是否接线，不能把接线结果自动当作原蜂窝环境的对照。日志不一定显示拒绝原因；不要为了获得日志先改网络接口或开启额外广告。
+
+## build 18：公钥取值试验与连接诊断（历史记录）
+
+此版填入 32 字节 Ed25519 公钥的 64 字符 hex，补充了“控制入站”、拒绝/等待/失败/就绪以及启动前校验失败日志，保留了停止/重启的过期回调保护。真机结果为两种本机模式完整等待 45 秒仍无控制入站。公钥字段的解释已按上节校正；历史发布说明保留当时实现，并附后续说明。
 
 ## build 17：本机监听器修复
 
@@ -46,7 +70,7 @@ build 17 的真机日志确认了以下阶段。反馈未包含完整 iOS 版本
 
 网络实测脚本新增固定端口的 ready 状态、TCP 回送与其他本机接口拒绝检查，以及端口占用和自动端口回退检查。此前自动端口探测成功，不能覆盖固定控制端口的初始化行为。
 
-每次实际启动会记录来源与尝试编号，监听器日志包含模式、绑定地址和端口。停止、失败或切换模式会取消过期的延迟重启任务。后续 build 17 真机反馈已确认监听器能够启动，并推进到配件认证和识别成功；剩余阻塞见上方 build 18 排查记录。
+每次实际启动会记录来源与尝试编号，监听器日志包含模式、绑定地址和端口。停止、失败或切换模式会取消过期的延迟重启任务。后续 build 17 真机反馈已确认监听器能够启动，并推进到配件认证和识别成功；后续完整超时与身份字段试验见上方 build 18/19 调查记录。
 
 ## 安装后的首次验证
 

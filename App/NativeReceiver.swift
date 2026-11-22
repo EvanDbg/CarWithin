@@ -72,8 +72,8 @@ final class NativeReceiver {
     // NetService must be published/stopped on a thread with a run loop (main).
     private var discoveryService: NetService?
     var onLog: ((String) -> Void)?
-    /// Main thread: the actual port and the active receiver's Ed25519 public key.
-    var onListening: ((UInt16, Data) -> Void)?
+    /// Main thread: the actual port and the active receiver's persistent pairing identifier (pi).
+    var onListening: ((UInt16, String) -> Void)?
     var onControlConnected: (() -> Void)?
     var onVideo: ((Data, VideoCodec) -> Void)?
     var onAirPlayReady: ((UUID) -> Void)?
@@ -190,7 +190,7 @@ final class NativeReceiver {
             }
         }
     }
-    private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16, Data) -> Void)?) {
+    private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16, String) -> Void)?) {
         guard let callbackToken = activeCallbackToken else { return }
         let generation = self.generation
         let context = "mode=\(configuration.networkMode.rawValue), bind=\(configuration.listenerAddress ?? "所有网络接口"), port=\(port.map { String($0) } ?? "自动")"
@@ -216,16 +216,12 @@ final class NativeReceiver {
                         return
                     }
                     guard let credentials = self.airPlayIdentity else {
-                        self.fail("监听器缺少 AirPlay 身份 [\(context)]；不会发送空公钥的会话请求。")
+                        self.fail("监听器缺少 AirPlay 身份 [\(context)]；无法准备会话的配对标识。")
                         return
                     }
                     // Snapshot on the receiver queue. The main-thread callback
                     // must not read a mutable identity from a later startup.
-                    let publicKey = credentials.signingKey.publicKey.rawRepresentation
-                    guard publicKey.count == 32 else {
-                        self.fail("AirPlay 公钥长度无效 [\(context)]；已停止启动。")
-                        return
-                    }
+                    let pairingIdentifier = credentials.identifier
                     self.log("原生 RTSP 监听器已在 \(configuration.listenerAddress ?? "所有网络接口"):\(actualPort) 就绪")
                     let advertiseDiscovery = self.advertiseServices
                     DispatchQueue.main.async { [weak self] in
@@ -238,7 +234,7 @@ final class NativeReceiver {
                             self.discoveryService?.stop(); self.discoveryService = service; service.publish()
                             self.onLog?("正在通过 \(ReceiverConfiguration.discoveryType) 发布 \(configuration.name)")
                         }
-                        onReady?(actualPort, publicKey)
+                        onReady?(actualPort, pairingIdentifier)
                     }
                 case .waiting(let error):
                     self.log("控制监听器等待网络 [\(context)]：\(error.localizedDescription)")

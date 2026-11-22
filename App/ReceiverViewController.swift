@@ -1473,6 +1473,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         cancelScheduledRestart(reason: "收到新的启动请求（\(source.rawValue)）")
         startAttempt += 1
         log("启动请求 #\(startAttempt)：来源=\(source.rawValue)，设备模式=\(modeControl.selectedSegmentIndex)，网络模式=\(effectiveNetworkMode.rawValue)")
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
+        let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知"
+        log("运行环境：系统=\(ProcessInfo.processInfo.operatingSystemVersionString)，App=\(appVersion)（build \(appBuild)）")
         if !restartingAutomatically { networkRestartCount = 0 }
         clearStartupHint()
         updateCheckTask?.cancel()
@@ -1535,7 +1538,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             UIApplication.shared.isIdleTimerDisabled = true
             startButton.setTitle("停止 iPad 连接", for: .normal)
             log("正在请求把本机 CarPlay 投送到 \(target.name)（\(target.address):\(target.port)）")
-            // The remote iPad owns the receiver key; never substitute this phone's key.
+            // The remote iPad owns the receiver identity; never substitute this phone's identity.
             sameDevice.start(configuration: config, identity: identity, expectsLocalControl: false)
             return
         }
@@ -1577,12 +1580,12 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             localStartupID = startupID
             localStartupStage = "等待本机监听器"
             if config.isLocalOnly { scheduleLocalStartupDeadline(startupID) }
-            receiver.onListening = { [weak self] port, publicKey in
+            receiver.onListening = { [weak self] port, pairingIdentifier in
                 guard let self, self.running, self.localStartupID == startupID else { return }
                 self.localStartupStage = "监听器已就绪，等待虚拟配件和控制连接"
                 var live = config; live.port = port
                 if !config.isLocalOnly { self.controlBrowser.start() }
-                self.sameDevice.start(configuration: live, identity: identity, airPlayPublicKey: publicKey)
+                self.sameDevice.start(configuration: live, identity: identity, airPlayPairingIdentifier: pairingIdentifier)
             }
             if !config.isLocalOnly { prepareExternalOutput(configuration: config) }
             log("启动请求 #\(startAttempt)：开始创建原生接收器")
@@ -1755,9 +1758,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
                   !self.displayedVideo, self.modeControl.selectedSegmentIndex == 1 else { return }
             switch self.effectiveNetworkMode {
             case .loopback:
-                self.startupHint.text = "正在验证本机回环会话。若超时，请保存日志；可在停止后手动测试 LocalDevVPN 备用方式。"
+                self.startupHint.text = "正在等待本机 CarPlay。请留在前台，未收到控制连接时约 45 秒会自动停止；若超时，请保存完整日志。"
             case .localDevVPN:
-                self.startupHint.text = "正在验证本机隧道会话。请保持 LocalDevVPN 开启；网络可达仍需 iOS 接受 CarPlay 会话。"
+                self.startupHint.text = "正在等待本机 CarPlay。请保持 LocalDevVPN 开启并留在前台，未收到控制连接时约 45 秒会自动停止；若超时，请保存完整日志。"
             case .wifi:
                 self.startupHint.text = "连接较久时，可尝试在系统设置中关闭再打开 Wi-Fi。当前仍在继续连接。"
             }

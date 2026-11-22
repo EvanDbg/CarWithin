@@ -15,7 +15,7 @@ final class SameDeviceProbe {
     private var session: UInt8 = 1
     private var identity: AccessoryIdentity?
     private var configuration: ReceiverConfiguration?
-    /// Prepared before opening iAP2. Every retry uses the same endpoint/key snapshot.
+    /// Prepared before opening iAP2. Every retry uses the same endpoint/identity snapshot.
     private var startSessionBytes: Data?
     private var messageBytes = Data()
     private var requested = false
@@ -26,7 +26,7 @@ final class SameDeviceProbe {
     var onStage: ((String) -> Void)?
 
     func start(configuration: ReceiverConfiguration, identity: AccessoryIdentity, expectsLocalControl: Bool = true,
-               airPlayPublicKey: Data? = nil) {
+               airPlayPairingIdentifier: String? = nil) {
         stop(); active = true; self.identity = identity; self.configuration = configuration
         self.expectsLocalControl = expectsLocalControl
         let run = generation
@@ -35,9 +35,13 @@ final class SameDeviceProbe {
             try configuration.validateNetworkMode()
             let request = try configuration.networkMode.startSession(address: configuration.address, port: configuration.port,
                 deviceID: configuration.deviceID, ssid: configuration.ssid, password: configuration.password,
-                wifiChannel: configuration.wifiChannel, airPlayPublicKey: airPlayPublicKey)
+                wifiChannel: configuration.wifiChannel, airPlayPairingIdentifier: airPlayPairingIdentifier)
             startSessionBytes = try request.encoded()
-            onLog?("CarPlay StartSession 已准备，AirPlay 公钥长度：\(airPlayPublicKey.map { String($0.count) + " 字节" } ?? "未随请求提供")")
+            if let airPlayPairingIdentifier {
+                onLog?("CarPlay StartSession 已准备：field4=接收器配对标识 pi，UTF-8 长度 \(airPlayPairingIdentifier.utf8.count) 字节（不含终止符）；此取值仍需真机验证")
+            } else {
+                onLog?("CarPlay StartSession 已准备：未提供远端接收器配对标识，沿用原远端请求")
+            }
             // Keep the known accessory transport. A successful TCP self-probe
             // does not prove iOS accepts CarPlay without a Wi-Fi association.
             if configuration.isLocalOnly {

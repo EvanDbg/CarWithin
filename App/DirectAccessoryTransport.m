@@ -44,7 +44,8 @@ static BOOL HasMethod(id object, NSString *name, NSUInteger arguments) {
             [self stop];
             return Failed(error, @"CoreAccessories transport methods are unavailable or have changed.");
         }
-        // Try connection type 2, then 1; the Wi-Fi endpoint uses transport type 2.
+        // Preserve connection type 2, then 1. Endpoint type 2 is Bluetooth Classic
+        // in the inspected iOS enums; this virtual iAP2 endpoint is not a media network interface.
         id connection = ((id (*)(id, SEL, NSUInteger, id))objc_msgSend)(self.client, NSSelectorFromString(create), 2, identifier);
         if (!connection) connection = ((id (*)(id, SEL, NSUInteger, id))objc_msgSend)(self.client, NSSelectorFromString(create), 1, identifier);
         if (![connection isKindOfClass:NSString.class]) {
