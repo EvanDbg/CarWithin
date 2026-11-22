@@ -15,6 +15,8 @@ final class SameDeviceProbe {
     private var session: UInt8 = 1
     private var identity: AccessoryIdentity?
     private var configuration: ReceiverConfiguration?
+    /// Prepared before opening iAP2. Every retry uses the same endpoint/key snapshot.
+    private var startSessionBytes: Data?
     private var messageBytes = Data()
     private var requested = false
     private var controlConnected = false
@@ -23,13 +25,19 @@ final class SameDeviceProbe {
     var onFinished: ((String) -> Void)?
     var onStage: ((String) -> Void)?
 
-    func start(configuration: ReceiverConfiguration, identity: AccessoryIdentity, expectsLocalControl: Bool = true) {
+    func start(configuration: ReceiverConfiguration, identity: AccessoryIdentity, expectsLocalControl: Bool = true,
+               airPlayPublicKey: Data? = nil) {
         stop(); active = true; self.identity = identity; self.configuration = configuration
         self.expectsLocalControl = expectsLocalControl
         let run = generation
         transport.onData = { [weak self] data in self?.receive(data) }
         do {
             try configuration.validateNetworkMode()
+            let request = try configuration.networkMode.startSession(address: configuration.address, port: configuration.port,
+                deviceID: configuration.deviceID, ssid: configuration.ssid, password: configuration.password,
+                wifiChannel: configuration.wifiChannel, airPlayPublicKey: airPlayPublicKey)
+            startSessionBytes = try request.encoded()
+            onLog?("CarPlay StartSession 已准备，AirPlay 公钥长度：\(airPlayPublicKey.map { String($0.count) + " 字节" } ?? "未随请求提供")")
             // Keep the known accessory transport. A successful TCP self-probe
             // does not prove iOS accepts CarPlay without a Wi-Fi association.
             if configuration.isLocalOnly {
@@ -62,7 +70,7 @@ final class SameDeviceProbe {
     }
     func stop() {
         active = false; generation = UUID(); transport.stop(); transport.onData = nil; parser = IAP2Parser()
-        identity = nil; configuration = nil; messageBytes = Data(); sequence = 0x10; acknowledgement = 0
+        identity = nil; configuration = nil; startSessionBytes = nil; messageBytes = Data(); sequence = 0x10; acknowledgement = 0
         session = 1; lastPayloadSequence = nil; linked = false; authenticated = false; identified = false; requested = false; controlConnected = false
     }
     func didConnectControl() {
@@ -70,10 +78,9 @@ final class SameDeviceProbe {
         controlConnected = true
         stage("CarPlay 控制连接已建立，正在协商会话")
     }
-    private func requestSession(_ configuration: ReceiverConfiguration) throws {
-        try send(configuration.networkMode.startSession(address: configuration.address, port: configuration.port,
-            deviceID: configuration.deviceID, ssid: configuration.ssid, password: configuration.password,
-            wifiChannel: configuration.wifiChannel))
+    private func requestSession() throws {
+        guard let startSessionBytes else { throw ProtocolError.malformed("CarPlay StartSession 尚未准备") }
+        try send(payload: startSessionBytes, messageID: 0x4301)
     }
     private func stage(_ message: String) { onLog?(message); onStage?(message) }
     private func finish(_ message: String) { onLog?(message); stop(); onFinished?(message) }
@@ -81,10 +88,14 @@ final class SameDeviceProbe {
         try transport.send(IAP2Packet(control: 0x40, sequence: sequence, acknowledgement: acknowledgement, session: 0).encoded())
     }
     private func send(_ message: IAP2Message) throws {
+        try send(payload: message.encoded(), messageID: message.id)
+    }
+    private func send(payload: Data, messageID: UInt16) throws {
         sequence &+= 1
         try transport.send(IAP2Packet(control: 0x40, sequence: sequence, acknowledgement: acknowledgement,
-            session: session, payload: message.encoded()).encoded())
-        onLog?(String(format: "发送 iAP2 消息 0x%04X", message.id))
+            session: session, payload: payload).encoded())
+        let detail = messageID == 0x4301 ? "（仅表示请求已发送，尚未确认 iOS 接受会话）" : ""
+        onLog?(String(format: "发送 iAP2 消息 0x%04X", messageID) + detail)
     }
     private func receive(_ data: Data) {
         guard active else { return }
@@ -140,18 +151,26 @@ final class SameDeviceProbe {
             guard authenticated, identified else { throw ProtocolError.malformed("认证或识别完成前收到 CarPlay 可用通知") }
             for group in message.parameters {
                 let nested = try IAP2Parameter.parse(group.value)
-                if let value = nested.first(where: { $0.id == 0 })?.value.first {
-                    onLog?("CarPlay 可用传输 \(group.id)：\(value)")
+                // Availability group IDs are not ACCTransportClient transport types.
+                let label: String
+                switch group.id {
+                case 0: label = "有线（wired）"
+                case 1: label = "无线（wireless）"
+                case 2: label = "主题资源"
+                default: label = "未知组 \(group.id)"
                 }
+                let available = nested.first(where: { $0.id == 0 })?.value.first.map { String($0) } ?? "未提供"
+                let identifierLength = nested.first(where: { $0.id == 1 }).map { String($0.value.count) + " 字节（含终止符，如有）" } ?? "未提供"
+                onLog?("CarPlay \(label)可用性：\(available)，field1 标识长度：\(identifierLength)")
             }
             if controlConnected || (!expectsLocalControl && requested) { return }
-            try requestSession(configuration)
+            try requestSession()
             if !requested && expectsLocalControl {
                 let run = generation
                 for delay in [3.0, 6.0, 9.0] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                         guard let self, self.active, self.generation == run, !self.controlConnected else { return }
-                        do { try self.requestSession(configuration) }
+                        do { try self.requestSession() }
                         catch { self.finish("会话重试失败：\(error)") }
                     }
                 }

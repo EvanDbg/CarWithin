@@ -37,7 +37,14 @@ public enum AccessoryMessages {
             IAP2Parameter(id: 2, value: Data()), IAP2Parameter(id: 4, value: Data())]))
         return IAP2Message(id: 0x1d01, parameters: fields)
     }
-    public static func startSession(address: String, port: UInt16, deviceID: String, wifi: WiFi? = nil) throws -> IAP2Message {
+    /// Field 4 is the receiver's long-term Ed25519 AirPlay key, not its MFi certificate key.
+    /// Nil preserves the legacy request for a remote Wi-Fi receiver whose key is not known here.
+    public static func startSession(address: String, port: UInt16, deviceID: String, wifi: WiFi? = nil,
+                                    airPlayPublicKey: Data? = nil) throws -> IAP2Message {
+        if let airPlayPublicKey, airPlayPublicKey.count != 32 {
+            throw ProtocolError.malformed("AirPlay Ed25519 public key must be 32 bytes")
+        }
+        let publicKeyHex = airPlayPublicKey?.map { String(format: "%02x", $0) }.joined() ?? ""
         // sendCarPlayStartSessionManual calls appendU32TLV for parameter 2.
         let portBytes = Data([0, 0, UInt8(truncatingIfNeeded: port >> 8), UInt8(truncatingIfNeeded: port)])
         var fields = [try group(0, [string(0, address)])]
@@ -47,7 +54,7 @@ public enum AccessoryMessages {
                 IAP2Parameter(id: 2, value: Data([wifi.channel])), string(3, address),
                 IAP2Parameter(id: 4, value: Data([wifi.password.isEmpty ? 0 : 2]))]))
         }
-        fields += [IAP2Parameter(id: 2, value: portBytes), string(3, deviceID), string(4, ""), string(5, "509.11")]
+        fields += [IAP2Parameter(id: 2, value: portBytes), string(3, deviceID), string(4, publicKeyHex), string(5, "509.11")]
         return IAP2Message(id: 0x4301, parameters: fields)
     }
 }

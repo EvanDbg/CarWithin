@@ -43,12 +43,18 @@ public enum ReceiverNetworkMode: String, CaseIterable {
 
     /// Uses the existing wire encoder; local modes never include a Wi-Fi TLV,
     /// even if a previously saved SSID/password is still present in the UI.
+    /// Local receivers supply their own AirPlay key because discovery is off.
     public func startSession(address: String, port: UInt16, deviceID: String,
-                             ssid: String, password: String, wifiChannel: UInt8) throws -> IAP2Message {
+                             ssid: String, password: String, wifiChannel: UInt8,
+                             airPlayPublicKey: Data? = nil) throws -> IAP2Message {
         try validateSessionAddress(address)
+        guard !isLocalOnly || airPlayPublicKey != nil else {
+            throw ProtocolError.malformed("本机 CarPlay 会话缺少接收器的 AirPlay 公钥")
+        }
         let wifi = try requiresWiFiCredentials
             ? AccessoryMessages.WiFi(ssid: ssid, password: password, channel: wifiChannel)
             : nil
-        return try AccessoryMessages.startSession(address: address, port: port, deviceID: deviceID, wifi: wifi)
+        return try AccessoryMessages.startSession(address: address, port: port, deviceID: deviceID, wifi: wifi,
+                                                 airPlayPublicKey: airPlayPublicKey)
     }
 }

@@ -44,6 +44,11 @@ final class NativeReceiver {
     private var displaySize: (width: Int, height: Int)?
     private var nightMode: Bool?
     private var generation = UUID()
+    // Public start/stop invalidate callbacks synchronously, before their queued
+    // work runs. This token is lock-protected; generation stays queue-confined.
+    private let callbackLock = NSLock()
+    private var callbackToken = UUID()
+    private var activeCallbackToken: UUID?
     private var airPlayIdentity: AirPlayCredentials?
     private var advertiseServices = false
     private var localPathProbe: LocalReceiverPathProbe?
@@ -67,7 +72,8 @@ final class NativeReceiver {
     // NetService must be published/stopped on a thread with a run loop (main).
     private var discoveryService: NetService?
     var onLog: ((String) -> Void)?
-    var onListening: ((UInt16) -> Void)?
+    /// Main thread: the actual port and the active receiver's Ed25519 public key.
+    var onListening: ((UInt16, Data) -> Void)?
     var onControlConnected: (() -> Void)?
     var onVideo: ((Data, VideoCodec) -> Void)?
     var onAirPlayReady: ((UUID) -> Void)?
@@ -76,10 +82,12 @@ final class NativeReceiver {
 
     func start(configuration: ReceiverConfiguration, identity: AccessoryIdentity, advertise: Bool = true,
                preferredViewer: UUID? = nil) {
+        let callbackToken = renewCallbackToken()
         let listening = onListening
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.callbackIsCurrent(callbackToken) else { return }
             self.stopOnQueue()
+            self.activeCallbackToken = callbackToken
             do { try configuration.validateNetworkMode() }
             catch { self.fail(error.localizedDescription); return }
             self.advertiseServices = advertise && !configuration.isLocalOnly
@@ -182,7 +190,8 @@ final class NativeReceiver {
             }
         }
     }
-    private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16) -> Void)?) {
+    private func listen(configuration: ReceiverConfiguration, identity: AccessoryIdentity, port: UInt16?, onReady: ((UInt16, Data) -> Void)?) {
+        guard let callbackToken = activeCallbackToken else { return }
         let generation = self.generation
         let context = "mode=\(configuration.networkMode.rawValue), bind=\(configuration.listenerAddress ?? "所有网络接口"), port=\(port.map { String($0) } ?? "自动")"
         do {
@@ -206,10 +215,21 @@ final class NativeReceiver {
                         self.fail("监听器未获得端口 [\(context)]；已停止，不会自动重试，请手动重试。")
                         return
                     }
+                    guard let credentials = self.airPlayIdentity else {
+                        self.fail("监听器缺少 AirPlay 身份 [\(context)]；不会发送空公钥的会话请求。")
+                        return
+                    }
+                    // Snapshot on the receiver queue. The main-thread callback
+                    // must not read a mutable identity from a later startup.
+                    let publicKey = credentials.signingKey.publicKey.rawRepresentation
+                    guard publicKey.count == 32 else {
+                        self.fail("AirPlay 公钥长度无效 [\(context)]；已停止启动。")
+                        return
+                    }
                     self.log("原生 RTSP 监听器已在 \(configuration.listenerAddress ?? "所有网络接口"):\(actualPort) 就绪")
                     let advertiseDiscovery = self.advertiseServices
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.generation == generation else { return }
+                        guard let self, self.callbackIsCurrent(callbackToken) else { return }
                         if advertiseDiscovery {
                             let service = NetService(domain: "local.", type: ReceiverConfiguration.discoveryType,
                                 name: configuration.name, port: Int32(actualPort))
@@ -218,8 +238,10 @@ final class NativeReceiver {
                             self.discoveryService?.stop(); self.discoveryService = service; service.publish()
                             self.onLog?("正在通过 \(ReceiverConfiguration.discoveryType) 发布 \(configuration.name)")
                         }
-                        onReady?(actualPort)
+                        onReady?(actualPort, publicKey)
                     }
+                case .waiting(let error):
+                    self.log("控制监听器等待网络 [\(context)]：\(error.localizedDescription)")
                 case .failed(let error):
                     if port != nil, case .posix(.EADDRINUSE) = error {
                         self.log("端口 \(port!) 已被占用，正在申请可用端口")
@@ -230,28 +252,44 @@ final class NativeReceiver {
                 }
             }
             candidate.newConnectionHandler = { [weak self, weak candidate] connection in
-                guard let self, self.generation == generation, self.listener === candidate,
-                      self.connections.count < 8 else { connection.cancel(); return }
+                guard let self, let candidate, self.generation == generation,
+                      self.listener === candidate else { connection.cancel(); return }
+                let id = UUID()
+                let connectionTag = String(id.uuidString.prefix(8))
+                self.log("控制入站 [\(connectionTag)]：端点=\(connection.endpoint)")
+                guard self.connections.count < 8 else {
+                    self.log("控制入站拒绝 [\(connectionTag)]：已达到 8 个连接上限")
+                    connection.cancel(); return
+                }
                 guard let peerAddress = ReceiverSocketBinding.ipv4Peer(connection.endpoint) else {
-                    self.log("控制连接需要 IPv4 对端")
+                    self.log("控制入站拒绝 [\(connectionTag)]：需要 IPv4 对端")
                     connection.cancel(); return
                 }
                 guard configuration.networkMode.allowsControlPeer(peerAddress) else {
-                    self.log("本机模式拒绝非预期控制对端：\(peerAddress)")
+                    self.log("本机模式拒绝非预期控制对端 [\(connectionTag)]：\(peerAddress)")
                     connection.cancel(); return
                 }
-                let id = UUID(); self.connections[id] = connection
+                self.connections[id] = connection
                 let state = SessionState(credentials: self.airPlayIdentity)
                 self.sessions[id] = state
                 state.peerAddress = peerAddress
                 connection.stateUpdateHandler = { [weak self, weak connection] update in
-                    guard let self, let connection else { return }
+                    guard let self, let connection, self.generation == generation else { return }
                     switch update {
                     case .ready:
-                        self.log("收到控制连接")
-                        DispatchQueue.main.async { [weak self] in self?.onControlConnected?() }
+                        self.log("收到控制连接 [\(connectionTag)]：对端=\(peerAddress)")
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.callbackIsCurrent(callbackToken) else { return }
+                            self.onControlConnected?()
+                        }
                         self.receive(connection, id: id, state: state, configuration: configuration, identity: identity)
-                    case .failed, .cancelled:
+                    case .waiting(let error):
+                        self.log("控制连接等待 [\(connectionTag)]：\(error.localizedDescription)")
+                    case .failed(let error):
+                        self.log("控制连接失败 [\(connectionTag)]：\(error.localizedDescription)")
+                        state.media?.stop(); self.sessions.removeValue(forKey: id); self.connections.removeValue(forKey: id)
+                    case .cancelled:
+                        self.log("控制连接已取消 [\(connectionTag)]")
                         state.media?.stop(); self.sessions.removeValue(forKey: id); self.connections.removeValue(forKey: id)
                     default: break
                     }
@@ -267,10 +305,38 @@ final class NativeReceiver {
         } catch { fail("无法创建监听器 [\(context)]：\(error)；已停止，不会自动重试，请手动重试。") }
     }
     private func fail(_ message: String) {
+        // Retire this run's ready/control callbacks without invalidating a newer
+        // public start/stop request that may already be waiting on the queue.
+        let failedCallbackToken = activeCallbackToken.flatMap { retireCallbackToken($0) }
         log(message); stopOnQueue()
-        DispatchQueue.main.async { [weak self] in self?.onFailure?() }
+        guard let failedCallbackToken else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.callbackIsCurrent(failedCallbackToken) else { return }
+            self.onFailure?()
+        }
     }
-    func stop() { queue.async { [weak self] in self?.stopOnQueue() } }
+    func stop() {
+        let callbackToken = renewCallbackToken()
+        queue.async { [weak self] in
+            guard let self, self.callbackIsCurrent(callbackToken) else { return }
+            self.stopOnQueue()
+        }
+    }
+    private func renewCallbackToken() -> UUID {
+        callbackLock.lock(); defer { callbackLock.unlock() }
+        callbackToken = UUID()
+        return callbackToken
+    }
+    private func callbackIsCurrent(_ token: UUID) -> Bool {
+        callbackLock.lock(); defer { callbackLock.unlock() }
+        return callbackToken == token
+    }
+    private func retireCallbackToken(_ token: UUID) -> UUID? {
+        callbackLock.lock(); defer { callbackLock.unlock() }
+        guard callbackToken == token else { return nil }
+        callbackToken = UUID()
+        return callbackToken
+    }
     private var activeMedia: CarPlayMediaSession? { sessions.values.first(where: { $0.media != nil })?.media }
     /// All fingers currently held by `source` (normalized 0…1); an empty list releases them.
     func touches(source: String, _ points: [TouchPoint]) {
@@ -351,6 +417,7 @@ final class NativeReceiver {
         (try? AnnexB.units(in: accessUnit))?.contains { codec.isRandomAccess($0) } ?? false
     }
     private func stopOnQueue() {
+        activeCallbackToken = nil
         DispatchQueue.main.async { [weak self] in self?.discoveryService?.stop(); self?.discoveryService = nil }
         generation = UUID(); listener?.cancel(); listener = nil
         localPathProbe?.stop(); localPathProbe = nil

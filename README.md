@@ -7,9 +7,9 @@
 - 可切回原 Wi-Fi 模式使用上游外部输出功能。
 - 独立应用名 `CarWithin Local`、Bundle ID `com.evandbg.carwithin.local`；更新入口指向本 fork。
 
-**状态：实验性实现，尚未完成真实 iPhone 的 CarPlay 会话验证。** 网络回送可达与编译成功都不等于 iOS 会接受这种配件会话。公开构建不包含配件身份、证书私钥或 Apple 签名材料；安装后需提供有效配件身份才能进行连接验证。
+**状态：实验性实现，尚未完成真实 iPhone 的完整 CarPlay 会话验证。** build 17 的真机反馈已确认两种本机模式可以启动监听器、通过配件认证和识别，但尚未观察到就绪的控制连接或画面。网络回送可达与配件认证通过不能代替完整会话验收。公开构建不包含配件身份、证书私钥或 Apple 签名材料。
 
-本分支安装包请从 [EvanDbg/CarWithin Releases](https://github.com/EvanDbg/CarWithin/releases) 下载。**1.0.3 / build 17** 修正指定本地地址时重复设置监听端口的问题，并为启动来源、监听端点和延迟重启增加诊断与取消保护；详见 [v1.0.3-local.2 发布说明](docs/releases/v1.0.3-local.2.md)。
+本分支安装包请从 [EvanDbg/CarWithin Releases](https://github.com/EvanDbg/CarWithin/releases) 下载。**1.0.3 / build 18** 为 iAP2 StartSession 补入接收器实际使用的 AirPlay 公钥，并记录入站连接状态和启动前失败原因；详见 [v1.0.3-local.3 发布说明](docs/releases/v1.0.3-local.3.md)。此修正仍需真机验证，不能承诺解决 iOS 对本机传输的限制。
 
 详细说明、构建流程和真机验收矩阵见 [docs/LOCAL-ONLY.md](docs/LOCAL-ONLY.md) 与 [SOURCE-BUILD.md](SOURCE-BUILD.md)。原项目及第三方版权和许可证保持不变。
 

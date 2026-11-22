@@ -1364,7 +1364,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }
     private func saveSettings(_ config: ReceiverConfiguration) -> Bool {
         do { if needsNetworkDetails { try WiFiCredentials.save(config.password, for: config.ssid) } }
-        catch { statusLabel.text = "无法安全保存 Wi-Fi 密码，请重试。"; return false }
+        catch {
+            rejectStartup("无法安全保存 Wi-Fi 配置：\(error.localizedDescription)", phase: "保存设置")
+            return false
+        }
         if needsNetworkDetails {
             passwordStatus.text = "Wi-Fi 密码已保存到 Keychain"
             UserDefaults.standard.set(config.ssid, forKey: "wifiSSID")
@@ -1455,6 +1458,11 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         startReceiver(source: .button)
     }
 
+    private func rejectStartup(_ message: String, phase: String) {
+        statusLabel.text = message
+        log("启动请求 #\(startAttempt) 已拒绝 [\(phase)]：\(message)")
+    }
+
     /// Internal callers only request a start; they must never toggle a newer
     /// running session off when an asynchronous callback arrives late.
     private func startReceiver(source: ReceiverStartSource) {
@@ -1472,7 +1480,8 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         refreshNetworkAddresses()
         let channel = needsNetworkDetails ? UInt8(channelField.text ?? "") ?? 36 : 36
         guard (1...196).contains(channel) else {
-            revealSettings(); statusLabel.text = "兼容信道请输入 1–196，或留空使用默认值 36。"; return
+            rejectStartup("兼容信道请输入 1–196，或留空使用默认值 36。", phase: "Wi-Fi 预设")
+            revealSettings(); return
         }
         let outputPort: UInt16?
         let httpsPort: UInt16?
@@ -1481,7 +1490,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             httpsPort = nil
         } else if outputMode == .browser && videoOutputSwitch.isOn {
             if let error = browserPortError {
-                statusLabel.text = error
+                rejectStartup(error, phase: "输出端口")
                 revealSettings(output: true)
                 return
             }
@@ -1489,6 +1498,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             httpsPort = secureBrowserPort
         } else if outputMode == .airPlay {
             guard let browserPort else {
+                rejectStartup("HTTP 端口请输入 1–65535。", phase: "AirPlay 输出端口")
                 revealSettings(output: true)
                 return
             }
@@ -1499,20 +1509,25 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             httpsPort = nil
         }
         guard !needsNetworkDetails || openNetworkSwitch.isOn || !(passwordField.text ?? "").isEmpty else {
-            statusLabel.text = "请输入 Wi-Fi 密码；开放网络请选择“无密码”。"
+            rejectStartup("请输入 Wi-Fi 密码；开放网络请选择“无密码”。", phase: "Wi-Fi 预设")
             revealSettings(wifi: true); return
         }
         let password = !needsNetworkDetails || openNetworkSwitch.isOn ? "" : (passwordField.text ?? "")
         if modeControl.selectedSegmentIndex == 2 {
-            guard let identity, let target = remoteTarget else {
-                statusLabel.text = "请先选择 iPad 接收端，并确保两台设备位于同一 Wi-Fi。"; return
+            guard let identity else {
+                rejectStartup("尚未载入有效配件身份。", phase: "配件身份"); return
+            }
+            guard let target = remoteTarget else {
+                rejectStartup("请先选择 iPad 接收端，并确保两台设备位于同一 Wi-Fi。", phase: "选择接收端"); return
             }
             let config = ReceiverConfiguration(name: target.name, address: target.address,
                 ssid: ssidField.text ?? "", password: password, port: target.port,
                 wifiChannel: channel, audioEnabled: false, videoOutputPort: nil, deviceID: target.deviceID)
             do { try config.validate(requiresLocalAddress: false) } catch {
-                revealSettings(); statusLabel.text = error.localizedDescription; return
+                rejectStartup(error.localizedDescription, phase: "配置校验")
+                revealSettings(); return
             }
+            log("启动请求 #\(startAttempt)：配置校验通过")
             guard saveSettings(config) else { return }
             if keepAliveSwitch.isOn { keepAlive.start() }
             view.endEditing(true); running = true; modeControl.isEnabled = false; setEditing(false)
@@ -1520,12 +1535,18 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             UIApplication.shared.isIdleTimerDisabled = true
             startButton.setTitle("停止 iPad 连接", for: .normal)
             log("正在请求把本机 CarPlay 投送到 \(target.name)（\(target.address):\(target.port)）")
+            // The remote iPad owns the receiver key; never substitute this phone's key.
             sameDevice.start(configuration: config, identity: identity, expectsLocalControl: false)
             return
         }
         if modeControl.selectedSegmentIndex == 1 {
-            guard let identity else { return }
-            guard let address = localCarPlayAddress else { waitForLocalNetwork(); return }
+            guard let identity else {
+                rejectStartup("尚未载入有效配件身份。", phase: "配件身份"); return
+            }
+            guard let address = localCarPlayAddress else {
+                log("启动请求 #\(startAttempt)：等待本机网络地址")
+                waitForLocalNetwork(); return
+            }
             var config = ReceiverConfiguration(name: nameField.text ?? "CarWithin", address: address,
                 ssid: isLocalOnly ? "" : ssidField.text ?? "", password: password, wifiChannel: channel, audioEnabled: soundOutput != .phone,
                 videoOutputPort: outputPort, secureVideoOutputPort: httpsPort,
@@ -1534,8 +1555,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             if !restartingAutomatically { autoRestarts = 0; lightLevel = 0; reportedScreen = nil; primaryViewer = nil }
             configureDisplay(&config)
             do { try config.validate() } catch {
-                revealSettings(); statusLabel.text = error.localizedDescription; return
+                rejectStartup(error.localizedDescription, phase: "配置校验")
+                revealSettings(); return
             }
+            log("启动请求 #\(startAttempt)：配置校验通过")
             liveDisplay = DisplayPlan(width: config.width, height: config.height, fps: config.maxFPS,
                                       codec: config.videoCodec, iconWidthMM: config.widthPhysicalMM)
             updateVideoAspect()
@@ -1554,19 +1577,22 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             localStartupID = startupID
             localStartupStage = "等待本机监听器"
             if config.isLocalOnly { scheduleLocalStartupDeadline(startupID) }
-            receiver.onListening = { [weak self] port in
+            receiver.onListening = { [weak self] port, publicKey in
                 guard let self, self.running, self.localStartupID == startupID else { return }
                 self.localStartupStage = "监听器已就绪，等待虚拟配件和控制连接"
                 var live = config; live.port = port
                 if !config.isLocalOnly { self.controlBrowser.start() }
-                self.sameDevice.start(configuration: live, identity: identity)
+                self.sameDevice.start(configuration: live, identity: identity, airPlayPublicKey: publicKey)
             }
             if !config.isLocalOnly { prepareExternalOutput(configuration: config) }
+            log("启动请求 #\(startAttempt)：开始创建原生接收器")
             receiver.start(configuration: config, identity: identity, preferredViewer: primaryViewer)
             if !config.isLocalOnly { watchStartupAddress(address) }
             return
         }
-        guard let identity else { return }
+        guard let identity else {
+            rejectStartup("尚未载入有效配件身份。", phase: "配件身份"); return
+        }
         let addresses = ReceiverConfiguration.localIPv4Addresses()
         if !addresses.contains(ipField.text ?? "") { ipField.text = browserAddress ?? addresses.first }
         var config = ReceiverConfiguration(name: nameField.text ?? "CarWithin", address: ipField.text ?? "",
@@ -1575,11 +1601,11 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             deviceID: ReceiverConfiguration.persistentDeviceID())
         configureDisplay(&config)
         do { try config.validate(requiresWiFiCredentials: needsNetworkDetails) } catch {
-            statusLabel.text = error.localizedDescription
-            log("无法启动：\(error.localizedDescription)")
+            rejectStartup(error.localizedDescription, phase: "配置校验")
             revealSettings(wifi: config.ssid.isEmpty)
             return
         }
+        log("启动请求 #\(startAttempt)：配置校验通过")
         guard saveSettings(config) else { return }
         sessionHasVehicleButton = CarPlayInfo.vehicleButtonSize(in: config) != nil
         if keepAliveSwitch.isOn { keepAlive.start() }
@@ -1587,13 +1613,14 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         running = true; modeControl.isEnabled = false; setEditing(false); startButton.setTitle("停止接收", for: .normal)
         startButton.configuration?.image = UIImage(systemName: "stop.fill")
         UIApplication.shared.isIdleTimerDisabled = true; statusLabel.text = "正在启动接收服务…"
-        receiver.onListening = { [weak self] port in
+        receiver.onListening = { [weak self] port, _ in
             guard let self, self.running else { return }
             var live = config; live.port = port
             self.statusLabel.text = "正在等待 iPhone 连接"
             if self.bluetoothSetupSwitch.isOn { self.bluetooth.start(configuration: live) }
         }
         prepareExternalOutput(configuration: config)
+        log("启动请求 #\(startAttempt)：开始创建原生接收器")
         receiver.start(configuration: config, identity: identity)
     }
     private var localCarPlayAddress: String? {

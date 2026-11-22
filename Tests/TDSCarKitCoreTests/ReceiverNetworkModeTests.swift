@@ -3,12 +3,14 @@ import XCTest
 @testable import TDSCarKitCore
 
 final class ReceiverNetworkModeTests: XCTestCase {
+    private let airPlayPublicKey = Data(repeating: 0xa5, count: 32)
+
     func testLocalRequestsOmitPreviouslySavedWiFiCredentials() throws {
         for mode in [ReceiverNetworkMode.loopback, .localDevVPN] {
             let address = try XCTUnwrap(mode.sessionAddress)
             let request = try mode.startSession(address: address, port: 51423,
                 deviceID: "02:03:04:05:06:07", ssid: "Saved private network",
-                password: "saved-passphrase", wifiChannel: 44)
+                password: "saved-passphrase", wifiChannel: 44, airPlayPublicKey: airPlayPublicKey)
             let wire = try request.encoded()
             let decoded = try IAP2Message.parse(wire)
             XCTAssertEqual(decoded.id, 0x4301)
@@ -17,6 +19,8 @@ final class ReceiverNetworkModeTests: XCTestCase {
             let addressGroup = try IAP2Parameter.parse(XCTUnwrap(decoded.parameters.first { $0.id == 0 }).value)
             XCTAssertEqual(addressGroup.first { $0.id == 0 }?.value, Data((address + "\0").utf8))
             XCTAssertEqual(decoded.parameters.first { $0.id == 2 }?.value, Data([0, 0, 0xc8, 0xdf]))
+            XCTAssertEqual(decoded.parameters.first { $0.id == 4 }?.value,
+                           Data((String(repeating: "a5", count: 32) + "\0").utf8))
         }
     }
 
@@ -24,10 +28,25 @@ final class ReceiverNetworkModeTests: XCTestCase {
         for mode in [ReceiverNetworkMode.loopback, .localDevVPN] {
             let address = try XCTUnwrap(mode.sessionAddress)
             XCTAssertNoThrow(try mode.startSession(address: address, port: 7000,
-                deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 0))
+                deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 0,
+                airPlayPublicKey: airPlayPublicKey))
             for invalidTarget in ["0.0.0.0", "192.168.1.23", "203.0.113.7"] {
                 XCTAssertThrowsError(try mode.startSession(address: invalidTarget, port: 7000,
-                    deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 36))
+                    deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 36,
+                    airPlayPublicKey: airPlayPublicKey))
+            }
+        }
+    }
+
+    func testLocalRequestsRejectMissingOrInvalidReceiverKeys() throws {
+        for mode in [ReceiverNetworkMode.loopback, .localDevVPN] {
+            let address = try XCTUnwrap(mode.sessionAddress)
+            XCTAssertThrowsError(try mode.startSession(address: address, port: 7000,
+                deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 0))
+            for count in [0, 31, 33, 64] {
+                XCTAssertThrowsError(try mode.startSession(address: address, port: 7000,
+                    deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 0,
+                    airPlayPublicKey: Data(repeating: 0xa5, count: count)))
             }
         }
     }
@@ -38,9 +57,26 @@ final class ReceiverNetworkModeTests: XCTestCase {
         let group = try IAP2Parameter.parse(XCTUnwrap(request.parameters.first { $0.id == 1 }).value)
         XCTAssertEqual(group.first { $0.id == 0 }?.value, Data("Car network\0".utf8))
         XCTAssertEqual(group.first { $0.id == 1 }?.value, Data("network-pass\0".utf8))
+        let decoded = try IAP2Message.parse(request.encoded())
+        XCTAssertEqual(decoded.parameters.first { $0.id == 4 }?.value, Data([0]))
         XCTAssertThrowsError(try ReceiverNetworkMode.wifi.startSession(address: "192.168.1.23", port: 7000,
             deviceID: "02:03:04:05:06:07", ssid: "", password: "", wifiChannel: 36))
         XCTAssertNil(ReceiverNetworkMode.wifi.listenerAddress)
+    }
+
+    func testWiFiModeAcceptsTheLocalReceiverKeyWithoutChangingOtherFields() throws {
+        let legacy = try ReceiverNetworkMode.wifi.startSession(address: "192.168.1.23", port: 51962,
+            deviceID: "02:03:04:05:06:07", ssid: "Car network", password: "network-pass", wifiChannel: 36)
+        let keyed = try ReceiverNetworkMode.wifi.startSession(address: "192.168.1.23", port: 51962,
+            deviceID: "02:03:04:05:06:07", ssid: "Car network", password: "network-pass", wifiChannel: 36,
+            airPlayPublicKey: airPlayPublicKey)
+        let decoded = try IAP2Message.parse(keyed.encoded())
+        XCTAssertEqual(decoded.parameters.filter { $0.id != 4 }, legacy.parameters.filter { $0.id != 4 })
+        XCTAssertEqual(decoded.parameters.first { $0.id == 4 }?.value,
+                       Data((String(repeating: "a5", count: 32) + "\0").utf8))
+        XCTAssertThrowsError(try ReceiverNetworkMode.wifi.startSession(address: "192.168.1.23", port: 7000,
+            deviceID: "02:03:04:05:06:07", ssid: "Car network", password: "network-pass", wifiChannel: 36,
+            airPlayPublicKey: Data(repeating: 0xa5, count: 31)))
     }
 
     func testVirtualPeerMustNotBeConfusedWithTheTunnelInterface() throws {
