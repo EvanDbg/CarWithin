@@ -65,7 +65,7 @@ final class SameDeviceProbe {
             DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
                 guard let self, self.active, self.generation == run, self.expectsLocalControl, !self.controlConnected else { return }
                 if self.configuration?.isLocalOnly == true {
-                    self.finish("未收到本机 CarPlay 控制连接。此设备上的实验会话尚未建立；请导出日志。不会自动切换 Wi-Fi 或 VPN。")
+                    self.finish("iOS 未建立本机 CarPlay 控制连接。请在「诊断与实验 → 日志」查看此次启动进度。")
                 } else {
                     self.finish("未收到 CarPlay 控制连接，请检查 Wi-Fi 名称和密码后重试。兼容信道通常可保持默认值。")
                 }

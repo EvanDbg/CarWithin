@@ -2,7 +2,31 @@
 
 这个分支尝试让同一台 iPhone 生成、接收、显示并操作 CarPlay，同时由蜂窝网络为地图、音乐等联网功能提供数据。默认使用本机回环连接，不要求安装外部 VPN，不把 CarPlay 画面通过 HTTP 服务分享给其他设备。
 
-**这是需要真机验证的实现方案。build 18 的回环和 LocalDevVPN 真机测试均已完整等待 45 秒而未收到控制连接；配件认证和识别成功，媒体与画面尚未建立。build 19 核对会话身份字段的另一种取值。编译成功、核心测试通过或普通 socket 回送成功，都不能证明完整 CarPlay 会话可用。下方验收矩阵中的完整使用场景仍待验证。**
+**iPhone 17 Pro Max（iOS 27.0.1）实测无法通过本机回环启动纯蜂窝 CarPlay。** build 19 的请求已到达 iOS 的 CarPlay 服务，系统在建立 TCP 控制连接之前判定无线和有线传输均不符合条件。
+
+## iOS 27.0.1 真机复测
+
+2026-11-23 使用 iPhone 17 Pro Max（iOS 27.0.1，24A446）测试 build 19。两轮均在系统设置关闭 Wi-Fi，保留 5G，使用 `127.0.0.1:7000`。第一轮接线读取实时日志。第二轮拔线后独立启动，等 App 自动停止后接回 Mac 读取历史日志。
+
+| 观察位置 | 结果 |
+| --- | --- |
+| CarWithin | iAP2 配件认证和识别成功，收到 `0x4300` 后发送 `0x4301`。 |
+| `accessoryd` / `carkitd` | 识别出启动请求携带的 `127.0.0.1` 有线地址，进入无 Wi-Fi 凭据的会话启动流程。 |
+| `airplayd`，接 USB 调试线 | `WiFi eligible: N (No Network SSID), USB eligible: N (USB transport type mismatch:8, Sim:No)`。 |
+| `airplayd`，拔掉 USB 线 | 四次 `0x4301` 均收到相同结果 `WiFi eligible: N (No Network SSID), USB eligible: N (No Network Interface)`。 |
+| CarWithin | 未收到控制连接，自动停止。未建立画面和触控通道。 |
+
+`airplayd` 在尝试连接接收端之前检查传输接口。这次请求已通过配件认证，也被系统解析为会话启动请求。回环和蜂窝网络在该次会话中均未成为可用的 CarPlay 传输接口，Mac 的 USB 调试连线也没有提供符合条件的有线接口。此前 LocalDevVPN 的测试只验证了 App 的 TCP 回送，尚未观察到系统采用该接口。iOS 26.1 的实现也按系统检测到的 Wi-Fi 或 USB 接口检查传输资格。[APTransport 的接口判断](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APTransport.mm#L4659)
+
+### 不连接外部 Wi-Fi 且仅使用一台 iPhone
+
+- **仅存在 Wi-Fi 与 USB 两类媒体通道**：`AirPlaySender` 中的 `APEndpointManagerCarPlay` 仅创建 `USB`、`WiFi` 和 `Session` 三个 CarPlay 浏览器，三者均经过 `APConnectivityHelper` 与 `carPlayHelperSession_updateNetworkAndSessionState` 的接口资格检查，没有回环、蜂窝或 VPN 专用入口。[APEndpointManagerCarPlay 初始化](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/AirPlaySender.framework/AirPlaySender/AirPlaySender_10.mm#L3366)
+- **Wi-Fi 开启但不加入任何网络同样不满足条件**：`APConnectivityHelper` 通过 `CWFInterface` 读取当前关联的 `networkName` 与 `currentKnownNetworkProfile`，而 `carPlayHelperSession_wifiNetworkChanged` 仅在 `wifiNetworkIsCarPlay` 为真时才记录 `wifiInterfaceName` 与 `wifiCurrentUUID`，后续还会校验它与 `carkitd` 保存的 `carplayWiFiUUID` 一致且网卡具备本地 IP。无论在系统设置关闭 Wi-Fi、开启 Wi-Fi 但未关联 AP，还是仅开启本机个人热点，客户端关联 SSID 均为空，仍会触发 `WiFi eligible: N (No Network SSID)`。[Wi-Fi 信息读取](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APConnectivityHelperPopulateCurrentWiFiNetworkInfo.mm#L6) · [Wi-Fi 状态过滤](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APTransport_07.mm#L9795)
+- **纯软件无法虚拟 USB 或用 VPN 网卡替代**：`_APConnectivityHelperHandleUSBNetworkChangedEvent` 监听 `SCDynamicStore` 的网卡链路状态并调用 `CoreUtils` 的 `SocketGetInterfaceInfo` 按内核 `ioctl` 标志分类，仅接受带 `IFEF_DIRECTLINK`（`0x10`）或 `IFNET_SUBFAMILY_USB`（`0x08`）的接口。`lo0`（回环）、`utun*`（`NEPacketTunnelProvider` / LocalDevVPN）与 `pdp_ip*`（蜂窝）均返回通用类型 `1`，不会被加入有线候选列表；未越狱 iOS 沙盒应用也无法在内核创建带上述标志的虚拟网卡。[USB 网卡筛选](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APTransport.mm#L4108) · [SocketGetInterfaceInfo 分类](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/CoreUtils.framework/CoreUtils/CoreUtils_01.mm#L4018)
+- 直接调用 CarKit 的会话请求服务仍会将请求交给 `APTransport`。在所核对的 iOS 26.1 实现中，该服务还会检查调用方的系统签名权限 `com.apple.private.carkit.sessionRequest`。普通应用开发签名无法授予该权限。[CarKit 权限检查](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/CarKit.framework/CarKit/CARSessionRequestAgent.mm#L92) · [APTransport 接收请求](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/System/Library/PrivateFrameworks/APTransport.framework/APTransport/APCarSessionRequestHandler.mm#L184)
+- 有线模拟器有独立的系统状态，`carkitd` 从自身状态设置它。`APTransport` 仍要求系统检测到活动的 USB 网络接口及其地址。Apple 提供的 CarPlay 模拟器运行在 Mac 上。[CarKit 的会话初始化](https://github.com/EthanArbuckle/iPhone18-3_26.1_23B85_Restore/blob/90aa0cfe59d9682b4265e1354c8b19ec3c7823ab/usr/libexec/carkitd/carkitd.mm#L5190) · [Apple CarPlay 开发者资料](https://developer.apple.com/carplay/)
+
+所核对的入口均未提供符合这组要求的本机媒体通道。真机失败发生在 RTSP、配对和视频协商之前。当前尚无可在目标 iPhone 上交付的纯蜂窝同机 CarPlay 版本。
 
 ## 基线与应用身份
 
@@ -19,7 +43,7 @@
 
 使用独立 Bundle ID 是为了和上游安装版本区分。新的签名或 Bundle ID 通常不会自动继承旧 App 的容器与 Keychain 身份，安装本分支后应查看其身份状态。
 
-## build 19：核对 StartSession 配对标识
+## build 19：核对 StartSession 配对标识的历史记录
 
 build 18 的最新反馈已覆盖完整 45 秒等待窗口。两种模式都没有“控制入站”；之前 8–13 秒手动停止的观察局限已由这两轮补齐。反馈仍未包含完整 iOS 版本和 Wi-Fi 关联状态，因此不能据此给某个具体 iOS 或纯蜂窝状态作兼容性结论。
 
@@ -76,7 +100,7 @@ build 18 参考 DiPlay，将 `0x4301` field 4 当作接收器 Ed25519 公钥并�
 
 1. 下载无签名 IPA，用自己的签名方式安装。
 2. 在“设置 → 配件身份 → 导入身份文件夹”选择包含三份有效认证材料的文件夹，确认状态变为“已载入并通过本地自检”。这一步只是本地材料检查，还没有证明 iOS 已接受配件。
-3. 在“设置 → 连接方式”选择“仅本机（无需 VPN）”，开启蜂窝数据，先测试 Wi-Fi 开启但未加入网络的情况。
+3. 在“设置 → 连接方式”选择“本机回环（实验）”（build 19 中显示为“仅本机（无需 VPN）”），开启蜂窝数据，先测试 Wi-Fi 开启但未加入网络的情况。
 4. 启动 CarPlay，观察是否完成配对、出现持续更新的画面，并实际测试触控。
 5. 停止后到系统设置完全关闭 Wi-Fi，再独立重复一次。失败时保留当前模式和停止阶段，不把上一轮成功当作这一轮也成功。
 
@@ -190,11 +214,11 @@ bash Tools/build_local_ipa.sh
 
 | 场景 | 操作与观察 | 通过条件 | 当前状态 |
 | --- | --- | --- | --- |
-| Wi-Fi 开启、未连接 | 在系统设置保持 Wi-Fi 开启，断开所有 Wi-Fi，蜂窝可用；冷启动 App | 无需 SSID/密码即可完成配件认证、配对并出现持续更新的首帧 | 待真机验证 |
-| Wi-Fi 完全关闭 | 在系统“设置”关闭 Wi-Fi；不能只用控制中心断开连接；蜂窝可用 | 与上一项分别记录，确认关闭无线接口后是否仍能建会话 | 待真机验证 |
+| Wi-Fi 开启、未连接 | 在系统设置保持 Wi-Fi 开启，断开所有 Wi-Fi，蜂窝可用；冷启动 App | 无需 SSID/密码即可完成配件认证、配对并出现持续更新的首帧 | 静态核对受同一 `No Network SSID` / `isCarPlay` 门禁阻断；未单独真机复测 |
+| Wi-Fi 完全关闭 | 在系统“设置”关闭 Wi-Fi，保持蜂窝可用 | 确认关闭无线接口后仍能建立会话 | iPhone 17 Pro Max，iOS 27.0.1，build 19，5G，接线和拔线两轮均未通过 |
 | 地图与在线音乐 | 默认回环模式下查询新地点、请求地图数据、播放未缓存内容 | 在线业务通过蜂窝可用，内部 CarPlay 会话保持；记录系统流量变化 | 待真机验证 |
 | 内部通道完整性 | 观察首帧、连续画面、触控、媒体/时间同步建立过程 | 不只控制端口连接成功；画面持续更新，触控有实际响应 | 待真机验证 |
-| 启动总期限 | 在前台复现控制 TCP 已连接、或 Pair-Verify/SETUP 已进行但始终没有视频样本提交的故障 | 若未因其他错误提前停止，本机模式约 75 秒后记录最后阶段并停止；回环模式提示手动测试 LocalDevVPN，VPN 模式提示检查身份、回送及 iOS 兼容性 | 待真机验证 |
+| 启动总期限 | 在前台复现控制 TCP 已连接、或 Pair-Verify/SETUP 已进行但始终没有视频样本提交的故障 | 若未因其他错误提前停止，本机模式约 75 秒后记录最后阶段并停止 | 待真机验证 |
 | 首帧判定与实际画面 | 区分只收到编码参数集、视频样本进入显示队列、屏幕真正出现画面这三个状态 | 仅参数集不能结束启动等待；首个视频样本提交显示层后可结束等待，但必须另外观察持续可见的画面，黑屏不能算通过 | 待真机验证 |
 | 无对外共享 | 仅为端口测试接入受控 Wi-Fi，保持“仅本机”模式；从另一台授权测试设备检查手机地址 | HTTP 9888、HTTPS 9889 与实际媒体端口不可由其他设备访问；无本 App 接收服务的 Bonjour 广告 | 待真机验证 |
 | 模式切换清理 | 停止“原 Wi-Fi 模式”后切到“仅本机（无需 VPN）”，再启动并重复对外端口检查 | 原网页、发现及媒体监听已清理，不残留前一模式的对外共享 | 待真机验证 |
@@ -212,7 +236,7 @@ bash Tools/build_local_ipa.sh
 
 排查时依次记录“身份已载入 → 本机配件已创建 → iAP2 认证/识别 → CarPlay 启动请求 → 控制连接与 Pair-Verify → SETUP/媒体通道 → 视频样本提交显示层 → 屏幕出现持续更新的画面 → 触控/音频”。哪一阶段停止，就先检查该阶段；没有配件身份时，无需把错误归因于蜂窝网络。
 
-两种本机模式都设置了 **75 秒启动总期限**。即使控制 TCP 已连接，或者已经完成 Pair-Verify、进入 SETUP，只要仍没有视频样本真正提交给显示层，这个总期限就继续生效。前台正常调度下，超时会在日志中写出最后到达的阶段，随后停止会话；更早发生的连接或认证错误也可以提前结束尝试。默认回环模式的超时提示建议保存日志后手动尝试 LocalDevVPN；LocalDevVPN 模式的提示则要求检查身份、包回送路径及当前 iOS 的兼容性。应用不会自动替用户切换 VPN。
+两种本机模式都设置了 **75 秒启动总期限**。即使控制 TCP 已连接，或者已经完成 Pair-Verify、进入 SETUP，只要仍没有视频样本真正提交给显示层，这个总期限就继续生效。前台超时会记录最后到达的阶段并停止会话。连接或认证错误可提前结束尝试。
 
 启动等待结束的标志来自 `H264Surface`：首个视频样本实际调用 `display.enqueue(sample)` 后，触发 `onFirstFrameEnqueued`，取消启动总期限并更新界面。只收到 SPS/PPS 等编码参数集、解析到网络包或建立控制连接，都不满足这个条件。日志中的“首个视频帧已送入本机显示层”只证明样本已提交，**不能证明硬件已经解码、画面已呈现或真机验收已通过**。
 

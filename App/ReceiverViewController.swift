@@ -19,7 +19,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private var remoteTarget: TDSCarKitReceiverBrowser.Target?
     private let modeControl = UISegmentedControl(items: ["接收其他设备", "本机 CarPlay", "投送到 iPad"])
     private static let networkChoices: [ReceiverNetworkMode] = [.loopback, .localDevVPN, .wifi]
-    private let networkModeControl = ChoiceMenu(items: ["仅本机（无需 VPN）", "LocalDevVPN（实验）", "原 Wi-Fi 模式"])
+    private let networkModeControl = ChoiceMenu(items: ["本机回环（实验）", "LocalDevVPN（实验）", "原 Wi-Fi 模式"])
     private var selectedNetworkMode: ReceiverNetworkMode {
         let index = networkModeControl.selectedSegmentIndex
         return Self.networkChoices.indices.contains(index) ? Self.networkChoices[index] : .loopback
@@ -718,7 +718,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             let summary: String
             if path.status != .satisfied { summary = "互联网暂不可用" }
             else if path.usesInterfaceType(.cellular) { summary = "系统当前使用蜂窝网络" }
-            else if path.usesInterfaceType(.wifi) { summary = "系统当前使用 Wi-Fi；纯蜂窝使用时请断开 Wi-Fi" }
+            else if path.usesInterfaceType(.wifi) { summary = "系统当前使用 Wi-Fi" }
             else { summary = "系统当前使用其他网络路径" }
             DispatchQueue.main.async {
                 self?.internetPathSummary = summary
@@ -1476,6 +1476,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
         let appBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "未知"
         log("运行环境：系统=\(ProcessInfo.processInfo.operatingSystemVersionString)，App=\(appVersion)（build \(appBuild)）")
+        if isLocalOnly { log(internetPathSummary) }
         if !restartingAutomatically { networkRestartCount = 0 }
         clearStartupHint()
         updateCheckTask?.cancel()
@@ -1731,12 +1732,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
             guard let self, self.running, !self.displayedVideo,
                   self.localStartupID == startupID else { return }
             let stage = self.localStartupStage
-            let suggestion = self.effectiveNetworkMode == .loopback
-                ? "保存日志后，可手动切换 LocalDevVPN（实验）再测试。"
-                : "保存日志并检查配件身份、LocalDevVPN 回送路径及当前 iOS 的兼容性。"
             self.log("本机启动超过 75 秒仍未向显示层提交视频帧。最后阶段：\(stage)")
             self.stop()
-            self.statusLabel.text = "本机会话启动超时。\(suggestion)"
+            self.statusLabel.text = "本机会话启动超时。请在「诊断与实验 → 日志」查看最后到达的阶段。"
         }
         localStartupDeadline = task
         DispatchQueue.main.asyncAfter(deadline: .now() + 75, execute: task)
@@ -1795,9 +1793,10 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }
         heading.attributedText = headingText
         explanation.text = remote ? "选择一台 iPad，把这台 iPhone 的 CarPlay 投送到它的屏幕。"
+            : isLocalOnly ? "在这台 iPhone 上尝试建立本机 CarPlay 会话。"
             : local ? "无需外接盒子，直接在这台 iPhone 上启动并显示 CarPlay。" : "接收另一台 iPhone 的导航、音乐和触控画面。"
         connectionHelp.text = isLocalOnly
-            ? "画面与操作留在本机，不开启网页共享。纯蜂窝使用时请断开 Wi-Fi；此模式仍需真机验证。"
+            ? "此模式用于连接测试。iPhone 17 Pro Max 在 iOS 27.0.1 的纯蜂窝实测中未建立会话。"
             : remote
             ? "让 iPhone 和 iPad 连接同一个 Wi-Fi。"
             : local ? "先在系统设置连接 Wi-Fi，再在 CarWithin 选择对应预设。"
@@ -2218,12 +2217,12 @@ extension ReceiverViewController {
     private func networkModePage() -> SettingsPageController {
         page("连接方式") { [unowned self] in
             [
-                SettingsSection("本机 CarPlay", footer: editingLockedFooter ?? "优先使用无需 VPN 的本机模式。是否能建立完整会话取决于这台 iPhone 的系统与签名，仍需实测。", [
+                SettingsSection("本机 CarPlay", footer: editingLockedFooter ?? "本机回环和 LocalDevVPN 用于测试 iOS 是否接受本机 CarPlay 连接。", [
                     .control("连接方式", icon: ("network", .systemIndigo), networkModeControl),
                     .info("系统网络", internetPathSummary)
                 ]),
-                SettingsSection("仅本机（无需 VPN）", footer: "使用本机回环连接，不要求 Wi-Fi 预设，也不启动网页共享。导航和音乐联网由 iOS 管理；要只使用蜂窝数据，请断开 Wi-Fi。", []),
-                SettingsSection("LocalDevVPN（实验备用）", footer: "仅在纯回环无法连接时手动测试。先在 LocalDevVPN 中启用默认配置：Tunnel IP 10.7.1.1、Device IP 10.7.0.1。普通代理 VPN 不等同于这种本机回送机制。应用不会自动安装、连接或修改 VPN。", []),
+                SettingsSection("本机回环（实验）", footer: "通过本机回环地址请求 CarPlay，测试结果可在「诊断与实验 → 日志」查看。", []),
+                SettingsSection("LocalDevVPN（实验）", footer: "用于测试回送路径。请在 LocalDevVPN 中手动配置 Tunnel IP 10.7.1.1 和 Device IP 10.7.0.1。真机测试曾验证回送，但 CarPlay 仍未连接。", []),
                 SettingsSection("原 Wi-Fi 模式", footer: "恢复原来的局域网与外部输出功能，需要加入 Wi-Fi。各输出设置仅在此模式下生效。", [])
             ]
         }
@@ -2264,17 +2263,15 @@ extension ReceiverViewController {
                         .guide("导入配件身份", icon: ("key.fill", .systemOrange),
                                "公开源码不附带配件认证材料。请在「配件身份」导入你有权使用的身份文件夹。IPA 的 Apple 签名与配件身份是两件事。")
                     ]),
-                    SettingsSection("2. 仅本机启动", [
-                        .guide("优先无需 VPN", icon: ("iphone", .systemBlue),
-                               "「连接方式」选择「仅本机（无需 VPN）」，断开 Wi-Fi 并开启蜂窝数据，再启动 CarPlay。本模式不要求填写 Wi-Fi 预设，也不提供网页共享。"),
-                        .guide("先验证画面与操作", icon: ("hand.tap", .systemTeal),
-                               "此分支仍需真机验证。必须实际出现 CarPlay 画面且触控有效；配件认证或网络探测通过并不代表会话已经成功。")
+                    SettingsSection("2. 本机连接测试", [
+                        .guide("本机回环", icon: ("iphone", .systemBlue),
+                               "在「连接方式」选择「本机回环（实验）」后启动测试。此方式会把回环地址发送给 iOS。"),
+                        .guide("查看连接进度", icon: ("hand.tap", .systemTeal),
+                               "在「诊断与实验 → 日志」查看配件认证、控制连接和画面的进度。")
                     ]),
-                    SettingsSection("3. 手动备用方式", [
+                    SettingsSection("3. 回送测试", [
                         .guide("LocalDevVPN 实验", icon: ("network", .systemOrange),
-                               "纯回环无法建立会话时，保存日志并停止，再启动按默认地址配置的 LocalDevVPN，选择对应备用模式。它不连接远程 VPN 服务器，CarPlay 兼容性仍待实测。"),
-                        .guide("声音与互联网", icon: ("speaker.wave.2.fill", .systemGreen),
-                               "声音使用 iPhone 当前扬声器或蓝牙。导航和音乐的互联网连接由 iOS 管理；要只用蜂窝数据，请保持 Wi-Fi 未连接，并允许相应应用使用蜂窝数据。")
+                               "此模式可测试虚拟接口上的回送路径。此前的真机测试中，回送通过后 CarPlay 仍未建立控制连接。")
                     ])
                 ]
             }
